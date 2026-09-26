@@ -1,0 +1,11 @@
+{
+  "name": "Remix Remix وصلها - خدمة التوصيل الذكية",
+  "description": "تطبيقك الأول لطلب خدمات التوصيل والطلبات داخل المنوفيه.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
