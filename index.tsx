@@ -2,7 +2,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { Capacitor } from '@capacitor/core';
-import { GoogleAuth } from '@codetrix-studio/capacitor-google-auth';
+import { GoogleSignIn } from '@capawesome/capacitor-google-sign-in';
 import App from './pages/App';
 import './styles/index.css';
 // تحميل تنسيقات خرائط Leaflet من الحزمة المثبّتة محلياً بدل تحميلها من
@@ -11,9 +11,12 @@ import './styles/index.css';
 // وغير منسقة. تحميلها هنا يضمن إنها تتحمّل دايماً مع باقي كود التطبيق.
 import 'leaflet/dist/leaflet.css';
 
-// تهيئة تسجيل الدخول بجوجل. على الويب بتحمّل مكتبة جوجل، وعلى تطبيق
-// الأندرويد بتقرأ الإعدادات (serverClientId) من capacitor.config.ts.
-GoogleAuth.initialize().catch((err) => console.warn('GoogleAuth init failed:', err));
+// تهيئة تسجيل الدخول بجوجل. لازم "Web Client ID" من Firebase Console
+// (Project settings > General > Your apps) أو Google Cloud Console، مش الـ
+// Android Client ID — نفس الـ ID ده بيتستخدم في كل المنصات (ويب/أندرويد/iOS).
+GoogleSignIn.initialize({
+  clientId: 'REPLACE_WITH_YOUR_WEB_CLIENT_ID.apps.googleusercontent.com',
+}).catch((err) => console.warn('GoogleSignIn init failed:', err));
 
 // تسجيل الـ Service Worker لإشعارات الويب فقط، مش مطلوب جوه تطبيق الأندرويد
 // لأن الإشعارات هناك بتتسجل عن طريق بلجن Capacitor الأصلي (Push Notifications)

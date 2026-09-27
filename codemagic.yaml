@@ -19,7 +19,7 @@ workflows:
     scripts:
       - name: تثبيت الباكدجات
         script: |
-          npm ci
+          npm install --no-audit --no-fund
       - name: بناء الويب (Vite build)
         script: |
           npm run build
