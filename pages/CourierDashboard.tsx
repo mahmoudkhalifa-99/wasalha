@@ -412,7 +412,7 @@ const CourierDashboard: React.FC<{ user: User }> = ({ user }) => {
                      </div>
                   </div>
                   <div className="grid grid-cols-1 gap-4">
-                     <button onClick={() => setActiveView('MAP')} className="w-full bg-emerald-500 text-white py-7 rounded-[2.2rem] font-black flex items-center justify-center gap-4 active:scale-95 transition-all shadow-xl shadow-emerald-900/10">
+                     <button onClick={() => setActiveView('MAP')} className="w-full bg-emerald-500 text-white py-7 rounded-3xl font-black flex items-center justify-center gap-4 active:scale-95 transition-all shadow-xl shadow-emerald-900/10">
                         <Crosshair className="h-7 w-7" /> الخريطة ومتابعة العميل
                      </button>
                      <div className="grid grid-cols-2 gap-4">
@@ -420,17 +420,17 @@ const CourierDashboard: React.FC<{ user: User }> = ({ user }) => {
                         <button onClick={() => setShowChat(true)} className="bg-white border-2 border-slate-100 text-slate-900 py-6 rounded-3xl font-black flex items-center justify-center gap-3 active:scale-95 shadow-sm"><MessageCircle className="h-6 w-6" /> دردشة</button>
                      </div>
                      {activeOrder.status === OrderStatus.ASSIGNED && (
-                        <button onClick={() => updateOrderStatus(OrderStatus.PICKED)} disabled={isSubmitting} className="w-full bg-emerald-600 text-white py-7 rounded-[2rem] font-black text-lg shadow-2xl active:scale-95 transition-all">
+                        <button onClick={() => updateOrderStatus(OrderStatus.PICKED)} disabled={isSubmitting} className="w-full bg-emerald-600 text-white py-7 rounded-3xl font-black text-lg shadow-2xl active:scale-95 transition-all">
                            {isSubmitting ? <Loader2 className="h-7 w-7 animate-spin mx-auto" /> : 'تأكيد الاستلام'}
                         </button>
                      )}
                      {activeOrder.status === OrderStatus.PICKED && (
-                        <button onClick={() => updateOrderStatus(OrderStatus.IN_DELIVERY)} disabled={isSubmitting} className="w-full bg-blue-600 text-white py-7 rounded-[2rem] font-black text-lg shadow-2xl active:scale-95 transition-all">
+                        <button onClick={() => updateOrderStatus(OrderStatus.IN_DELIVERY)} disabled={isSubmitting} className="w-full bg-blue-600 text-white py-7 rounded-3xl font-black text-lg shadow-2xl active:scale-95 transition-all">
                            {isSubmitting ? <Loader2 className="h-7 w-7 animate-spin mx-auto" /> : 'بدء التوصيل'}
                         </button>
                      )}
                      {activeOrder.status === OrderStatus.IN_DELIVERY && (
-                        <button onClick={() => updateOrderStatus(OrderStatus.DELIVERED)} disabled={isSubmitting} className="w-full bg-slate-900 text-white py-7 rounded-[2rem] font-black text-lg shadow-2xl active:scale-95 transition-all">
+                        <button onClick={() => updateOrderStatus(OrderStatus.DELIVERED)} disabled={isSubmitting} className="w-full bg-slate-900 text-white py-7 rounded-3xl font-black text-lg shadow-2xl active:scale-95 transition-all">
                            {isSubmitting ? <Loader2 className="h-7 w-7 animate-spin mx-auto" /> : 'تم التوصيل'}
                         </button>
                      )}
@@ -485,7 +485,7 @@ const CourierDashboard: React.FC<{ user: User }> = ({ user }) => {
                                  </div>
                                  <div className="bg-slate-950 text-emerald-400 p-6 rounded-[2.2rem] font-black text-3xl shrink-0 shadow-2xl">{o.price}</div>
                               </div>
-                              <button onClick={() => { setShowOfferInput(o.id); setOfferPrice(o.price.toString()); }} className="w-full bg-slate-950 text-white py-7 rounded-[2.5rem] font-black text-xl shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-4">
+                              <button onClick={() => { setShowOfferInput(o.id); setOfferPrice(o.price.toString()); }} className="w-full bg-slate-950 text-white py-7 rounded-3xl font-black text-xl shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-4">
                                  <Zap className="h-6 w-6 text-emerald-400" /> تقديم عرض سريع
                               </button>
                            </>
@@ -511,9 +511,9 @@ const CourierDashboard: React.FC<{ user: User }> = ({ user }) => {
            {id: 'ACTIVITY', icon: <History className="h-6 w-6" />, label: 'سجلي'},
            {id: 'PROFILE', icon: <UserIcon className="h-6 w-6" />, label: 'حسابي'}
          ].map(tab => (
-           <button key={tab.id} onClick={() => setActiveView(tab.id as any)} className={`flex flex-col items-center gap-1 transition-all ${activeView === tab.id ? 'text-emerald-600' : 'text-slate-300'}`}>
+           <button key={tab.id} onClick={() => setActiveView(tab.id as any)} className={`flex flex-col items-center gap-1 min-w-[56px] transition-all ${activeView === tab.id ? 'text-emerald-600' : 'text-slate-300'}`}>
               <div className={`p-3.5 rounded-2xl transition-all ${activeView === tab.id ? 'bg-emerald-50 shadow-inner scale-110' : ''}`}>{tab.icon}</div>
-              <span className="text-[9px] font-black uppercase tracking-widest">{tab.label}</span>
+              <span className="text-[11px] font-black uppercase tracking-wide">{tab.label}</span>
            </button>
          ))}
       </nav>

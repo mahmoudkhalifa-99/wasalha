@@ -8,11 +8,13 @@ import type { User, VehicleType, UserRole } from '../types';
 import { stripFirestore } from '../utils';
 
 // Services
-import { auth, db, googleProvider } from '../services/firebase';
+import { Capacitor } from '@capacitor/core';
+import { GoogleAuth } from '@codetrix-studio/capacitor-google-auth';
+import { auth, db, googleProvider, signInWithCredential, signInWithPopup } from '../services/firebase';
 import { 
   signInWithEmailAndPassword, 
   createUserWithEmailAndPassword,
-  signInWithPopup
+  GoogleAuthProvider
 } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 import { doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
@@ -213,7 +215,20 @@ const Login: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
     setLoading(true);
     setErrorMsg(null);
     try {
-      const result = await signInWithPopup(auth, googleProvider);
+      let result;
+      if (Capacitor.isNativePlatform()) {
+        // على تطبيق الأندرويد: جوجل بتمنع تسجيل الدخول عبر الـ WebView المدمج
+        // (نافذة signInWithPopup)، فلازم نستخدم شاشة تسجيل الدخول الأصلية
+        // بتاعة جوجل عن طريق بلجن Capacitor، وبعدين نبادل الـ idToken
+        // بجلسة Firebase عادية عبر signInWithCredential.
+        const googleUser = await GoogleAuth.signIn();
+        const idToken = googleUser.authentication?.idToken;
+        if (!idToken) throw new Error('NO_ID_TOKEN');
+        const credential = GoogleAuthProvider.credential(idToken);
+        result = await signInWithCredential(auth, credential);
+      } else {
+        result = await signInWithPopup(auth, googleProvider);
+      }
       const userSnap = await getDoc(doc(db, "users", result.user.uid));
       
       if (userSnap.exists()) {
@@ -241,7 +256,12 @@ const Login: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
         setIsCompletingProfile(true);
       }
     } catch (error: any) {
-      setErrorMsg("فشل تسجيل الدخول عبر جوجل، يرجى المحاولة مرة أخرى.");
+      console.error('Google sign-in error:', error);
+      // المستخدم لغى نافذة تسجيل الدخول بنفسه، مفيش داعي نظهر رسالة خطأ
+      const cancelled = error?.code === '12501' || error?.message === 'USER_CANCELLED' || error?.code === 'auth/popup-closed-by-user';
+      if (!cancelled) {
+        setErrorMsg("فشل تسجيل الدخول عبر جوجل، يرجى المحاولة مرة أخرى.");
+      }
     } finally {
       setLoading(false);
     }
@@ -670,7 +690,12 @@ const Login: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
                       disabled={loading}
                       className="w-full bg-white border border-slate-200/90 text-slate-700 py-3.5 rounded-2xl font-black text-sm shadow-sm active:scale-95 transition-all flex items-center justify-center gap-3 hover:bg-slate-50 hover:border-slate-300"
                     >
-                      <img src="https://img.icons8.com/color/48/000000/google-logo.png" className="h-5 w-5" alt="Google" />
+                      <svg className="h-5 w-5" viewBox="0 0 48 48" aria-hidden="true">
+                        <path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/>
+                        <path fill="#FF3D00" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/>
+                        <path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/>
+                        <path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/>
+                      </svg>
                       <span>المتابعة باستخدام Google</span>
                     </button>
                   </div>

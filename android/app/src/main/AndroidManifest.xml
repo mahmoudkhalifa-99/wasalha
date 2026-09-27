@@ -24,6 +24,14 @@
 
         </activity>
 
+        <!-- الأيقونة واللون الافتراضي لإشعارات Firebase Cloud Messaging -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@mipmap/ic_launcher" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_color"
+            android:resource="@color/colorPrimary" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -42,4 +50,6 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- مطلوبة من أندرويد 13 (API 33) وما بعده عشان الإشعارات تظهر فعلياً -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 </manifest>

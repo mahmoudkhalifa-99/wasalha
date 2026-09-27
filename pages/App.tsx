@@ -12,9 +12,11 @@ import { stripFirestore } from '../utils';
 import { LogOut, RefreshCcw, WifiOff, Loader2, Bell, MessageCircle, X } from 'lucide-react';
 
 // Services
+import { Capacitor } from '@capacitor/core';
+import { PushNotifications } from '@capacitor/push-notifications';
 import { auth, db } from '../services/firebase';
 import { onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
-import { doc, getDoc, setDoc, collection, query, where, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+import { doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
 // Components / UI
 import BrandLogo from '../components/BrandLogo';
@@ -136,6 +138,61 @@ const App: React.FC = () => {
     });
     return unsubscribe;
   };
+
+  // تفعيل إشعارات الأندرويد الأصلية (native) لما المستخدم يدخل التطبيق.
+  // ده بديل الطريقة القديمة اللي كانت بتعتمد على Web Push (VAPID) اللي أصلاً
+  // مش بتشتغل بشكل موثوق جوه تطبيق مبني بـ Capacitor.
+  useEffect(() => {
+    if (!user || !Capacitor.isNativePlatform()) return;
+
+    let registrationListener: any;
+    let registrationErrorListener: any;
+
+    const setupPush = async () => {
+      try {
+        const savedToken = async (token: string) => {
+          try {
+            await updateDoc(doc(db, "users", user.id), {
+              fcmToken: token,
+              notificationsEnabled: true,
+              lastTokenUpdate: Date.now(),
+            });
+          } catch (err) {
+            console.warn('Failed to save push token:', err);
+          }
+        };
+
+        registrationListener = await PushNotifications.addListener('registration', (token) => {
+          savedToken(token.value);
+        });
+        registrationErrorListener = await PushNotifications.addListener('registrationError', (err) => {
+          console.warn('Push registration error:', err);
+        });
+
+        // لو المستخدم سمح بالإشعارات قبل كده، نجدد التسجيل تلقائياً بصمت.
+        // لو أول مرة (prompt)، نطلب الإذن فوراً وقت الدخول بدل ما ننتظره
+        // يروح يدور على الزرار جوه صفحة الإشعارات.
+        const status = await PushNotifications.checkPermissions();
+        if (status.receive === 'granted') {
+          await PushNotifications.register();
+        } else if (status.receive === 'prompt' || status.receive === 'prompt-with-rationale') {
+          const req = await PushNotifications.requestPermissions();
+          if (req.receive === 'granted') {
+            await PushNotifications.register();
+          }
+        }
+      } catch (err) {
+        console.warn('Push notifications setup failed:', err);
+      }
+    };
+
+    setupPush();
+
+    return () => {
+      registrationListener?.remove?.();
+      registrationErrorListener?.remove?.();
+    };
+  }, [user?.id]);
 
   const handleLogout = async () => {
     setIsLogoutModalOpen(false);

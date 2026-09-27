@@ -381,7 +381,7 @@ const RestaurantMenuView: React.FC<{
           <button 
             onClick={() => currentVillage && onConfirmOrder(cart, totalFoodItemsPrice, deliveryPrice, finalEstimatedPrice, roadDist, currentVillage, specialRequest)}
             disabled={(cart.length === 0 && !specialRequest) || !currentVillage || isCalculating}
-            className="w-full bg-[#10b981] text-white py-7 rounded-[2.5rem] font-black text-xl shadow-2xl flex items-center justify-center gap-4 active:scale-95 transition-all disabled:opacity-30 disabled:grayscale"
+            className="w-full bg-[#10b981] text-white py-7 rounded-3xl font-black text-xl shadow-2xl flex items-center justify-center gap-4 active:scale-95 transition-all disabled:opacity-30 disabled:grayscale"
           >
              <ShoppingBag className="h-7 w-7" /> تأكيد وإرسال الطلب ({finalEstimatedPrice} ج.م)
           </button>
@@ -457,7 +457,7 @@ const ManualRestaurantView: React.FC<{
           <button 
              onClick={() => village && onConfirm({ name: restName, items, village })}
              disabled={!restName || !items || !village}
-             className="w-full bg-slate-950 text-white py-7 rounded-[2.5rem] font-black text-xl shadow-2xl active:scale-95 transition-all disabled:opacity-30 flex items-center justify-center gap-4"
+             className="w-full bg-slate-950 text-white py-7 rounded-3xl font-black text-xl shadow-2xl active:scale-95 transition-all disabled:opacity-30 flex items-center justify-center gap-4"
           >
              <Send className="h-6 w-6 text-emerald-400" /> إرسال الطلب الآن
           </button>
@@ -981,7 +981,7 @@ const CustomerDashboard: React.FC<{ user: User }> = ({ user }) => {
                        </div>
                        <textarea value={feedback} onChange={e => setFeedback(e.target.value)} placeholder="هل لديك أي ملاحظات أخرى على الرحلة؟ (اختياري)" className="w-full bg-white border-none rounded-[2rem] p-6 font-bold text-sm outline-none text-right shadow-inner min-h-[120px]" />
                     </div>
-                    <button onClick={handleRateTrip} disabled={isRatingSubmitting} className="w-full bg-[#10b981] text-white py-8 rounded-[3rem] font-black text-2xl shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-4">
+                    <button onClick={handleRateTrip} disabled={isRatingSubmitting} className="w-full bg-[#10b981] text-white py-8 rounded-3xl font-black text-2xl shadow-2xl active:scale-95 transition-all flex items-center justify-center gap-4">
                        {isRatingSubmitting ? <Loader2 className="h-8 w-8 animate-spin" /> : <><ThumbsUp /> تأكيد وإرسال التقييم</>}
                     </button>
                  </div>
@@ -1059,7 +1059,7 @@ const CustomerDashboard: React.FC<{ user: User }> = ({ user }) => {
              <button 
                key={tab.id} 
                onClick={() => setActiveView(tab.id as any)} 
-               className={`flex items-center gap-2 py-2 px-4 rounded-2xl transition-all border-none ${
+               className={`flex items-center gap-2 py-3.5 px-5 min-h-[48px] rounded-2xl transition-all border-none ${
                  isActive 
                    ? 'bg-emerald-600 text-white font-black shadow-md shadow-emerald-600/25 scale-105' 
                    : 'text-slate-500 hover:text-emerald-700 font-bold hover:bg-emerald-50/50'
