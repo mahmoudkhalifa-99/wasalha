@@ -9,7 +9,7 @@ import { stripFirestore } from '../utils';
 
 // Services
 import { Capacitor } from '@capacitor/core';
-import { GoogleAuth } from '@codetrix-studio/capacitor-google-auth';
+import { GoogleSignIn, ErrorCode as GoogleSignInErrorCode } from '@capawesome/capacitor-google-sign-in';
 import { auth, db, googleProvider, signInWithCredential, signInWithPopup } from '../services/firebase';
 import { 
   signInWithEmailAndPassword, 
@@ -221,10 +221,8 @@ const Login: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
         // (نافذة signInWithPopup)، فلازم نستخدم شاشة تسجيل الدخول الأصلية
         // بتاعة جوجل عن طريق بلجن Capacitor، وبعدين نبادل الـ idToken
         // بجلسة Firebase عادية عبر signInWithCredential.
-        const googleUser = await GoogleAuth.signIn();
-        const idToken = googleUser.authentication?.idToken;
-        if (!idToken) throw new Error('NO_ID_TOKEN');
-        const credential = GoogleAuthProvider.credential(idToken);
+        const googleUser = await GoogleSignIn.signIn();
+        const credential = GoogleAuthProvider.credential(googleUser.idToken);
         result = await signInWithCredential(auth, credential);
       } else {
         result = await signInWithPopup(auth, googleProvider);
@@ -258,7 +256,7 @@ const Login: React.FC<{ onLogin: (user: User) => void }> = ({ onLogin }) => {
     } catch (error: any) {
       console.error('Google sign-in error:', error);
       // المستخدم لغى نافذة تسجيل الدخول بنفسه، مفيش داعي نظهر رسالة خطأ
-      const cancelled = error?.code === '12501' || error?.message === 'USER_CANCELLED' || error?.code === 'auth/popup-closed-by-user';
+      const cancelled = error?.code === GoogleSignInErrorCode.SignInCanceled || error?.code === 'auth/popup-closed-by-user';
       if (!cancelled) {
         setErrorMsg("فشل تسجيل الدخول عبر جوجل، يرجى المحاولة مرة أخرى.");
       }
