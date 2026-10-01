@@ -5,7 +5,7 @@
 ## التشغيل
 ```bash
 bash setup_android.sh          # مرة واحدة: يولّد مشروع الأندرويد ويطبّق الأيقونات والصلاحيات
-flutterfire configure --project=sada-51292 --platforms=android --android-package-name=com.wasalha.app
+flutterfire configure --project=sada-51292 --platforms=android --android-package-name=com.wasalah.app
 flutter run --dart-define=GEMINI_API_KEY=your_key   # المفتاح مطلوب فقط لتشغيل المساعد الذكي
 ```
 تسجيل الدخول بجوجل: لازم بصمة SHA-1 لمفتاح التوقيع تتسجل في Firebase Console (بدون Web Client ID، مطلوب فقط google-services.json).

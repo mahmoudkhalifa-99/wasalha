@@ -28,7 +28,7 @@ dependencies:
   image: ^4.2.0
   url_launcher: ^6.3.1
   google_fonts: ^6.2.1
-  lucide_icons: ^0.257.0
+  lucide_icons_flutter: ^3.1.13
   flutter_svg: ^2.0.10+1
   intl: any
   file_selector: ^1.0.3

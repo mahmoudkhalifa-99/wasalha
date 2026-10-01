@@ -33,8 +33,10 @@ class T {
   }
 
   static const w400 = FontWeight.w400;
+  static const w500 = FontWeight.w500; // font-medium
   static const w600 = FontWeight.w600; // font-semibold
   static const w700 = FontWeight.w700; // font-bold
+  static const w800 = FontWeight.w800; // font-extrabold
   static const w900 = FontWeight.w900; // font-black
 
   static TextStyle s(

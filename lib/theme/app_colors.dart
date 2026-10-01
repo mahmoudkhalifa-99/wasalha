@@ -40,6 +40,7 @@ class C {
 
   // amber
   static const amber50 = Color(0xFFFFFBEB);
+  static const amber100 = Color(0xFFFEF3C7);
   static const amber200 = Color(0xFFFDE68A);
   static const amber800 = Color(0xFF92400E);
   static const amber300 = Color(0xFFFCD34D);
@@ -51,8 +52,11 @@ class C {
   // rose
   static const rose50 = Color(0xFFFFF1F2);
   static const rose100 = Color(0xFFFFE4E6);
+  static const rose200 = Color(0xFFFECDD3);
+  static const rose400 = Color(0xFFFB7185);
   static const rose500 = Color(0xFFF43F5E);
   static const rose600 = Color(0xFFE11D48);
+  static const rose700 = Color(0xFFBE123C);
 
   // blue
   static const blue600 = Color(0xFF2563EB);

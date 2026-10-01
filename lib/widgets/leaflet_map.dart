@@ -39,7 +39,7 @@ class _WasalhaMapState extends State<WasalhaMap> {
     final pts = widget.fitPoints;
     if (pts == null || pts.length < 2) return;
     try {
-      final bounds = ll.LatLngBounds.fromPoints(pts);
+      final bounds = LatLngBounds.fromPoints(pts);
       _controller.fitCamera(
         CameraFit.bounds(
           bounds: bounds,
@@ -73,7 +73,7 @@ class _WasalhaMapState extends State<WasalhaMap> {
           urlTemplate:
               'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
           subdomains: const ['a', 'b', 'c', 'd'],
-          userAgentPackageName: 'com.wasalha.app',
+          userAgentPackageName: 'com.wasalah.app',
         ),
         if (widget.routeGeometry.length > 1)
           PolylineLayer(polylines: [

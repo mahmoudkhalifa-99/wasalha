@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:lucide_icons/lucide_icons.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../app_router.dart';
 import '../../models/models.dart';
@@ -586,11 +586,11 @@ class _AdminEditUserState extends State<AdminEditUser> {
     );
   }
 
-  Widget _dropdownField<T>({
+  Widget _dropdownField<V>({
     required String label,
-    required T value,
-    required Map<T, String> items,
-    required void Function(T) onChanged,
+    required V value,
+    required Map<V, String> items,
+    required void Function(V) onChanged,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -608,7 +608,7 @@ class _AdminEditUserState extends State<AdminEditUser> {
             borderRadius: BorderRadius.circular(16),
           ),
           child: DropdownButtonHideUnderline(
-            child: DropdownButton<T>(
+            child: DropdownButton<V>(
               value: value,
               isExpanded: true,
               alignment: AlignmentDirectional.centerEnd,

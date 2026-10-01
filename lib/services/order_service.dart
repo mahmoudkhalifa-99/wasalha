@@ -1,5 +1,5 @@
 // نسخة Dart من services/orderService.ts — نفس المنطق بالظبط.
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 
 import '../models/models.dart';
 import 'firebase_service.dart';
