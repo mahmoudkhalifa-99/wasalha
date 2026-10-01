@@ -5,7 +5,7 @@ import os, re, shutil, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'android', 'app')
 if not os.path.isdir(APP):
-    sys.exit('android/app مش موجود — شغّل: flutter create --org com.wasalha --platforms=android .')
+    sys.exit('android/app مش موجود — شغّل: flutter create --org com.wasalah --platforms=android .')
 
 # 1) applicationId + minSdk (Firebase محتاج 23 على الأقل)
 for name in ('build.gradle.kts', 'build.gradle'):
@@ -13,7 +13,7 @@ for name in ('build.gradle.kts', 'build.gradle'):
     if not os.path.exists(p):
         continue
     s = open(p, encoding='utf-8').read()
-    s = re.sub(r'applicationId\s*=?\s*"[^"]+"', lambda m: m.group(0).split('"')[0] + '"com.wasalha.app"', s)
+    s = re.sub(r'applicationId\s*=?\s*"[^"]+"', lambda m: m.group(0).split('"')[0] + '"com.wasalah.app"', s)
     s = re.sub(r'minSdk(Version)?\s*=?\s*flutter\.minSdkVersion',
                lambda m: m.group(0).replace('flutter.minSdkVersion', '23'), s)
     open(p, 'w', encoding='utf-8').write(s)
