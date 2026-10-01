@@ -1052,7 +1052,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
                   ),
                 ),
                 if (dest != null)
-                  order.status == OrderStatus.assigned
+                  order?.status == OrderStatus.assigned
                       ? pickupPointMarker(ll.LatLng(dest.lat, dest.lng))
                       : customerHomeMarker(ll.LatLng(dest.lat, dest.lng)),
               ],
