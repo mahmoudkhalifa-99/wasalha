@@ -10,6 +10,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/models.dart';
 import '../services/firebase_service.dart';
+import '../services/notification_service.dart';
 import '../services/order_service.dart' as order_service;
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
@@ -54,6 +55,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
   @override
   void initState() {
     super.initState();
+    _setOnlineFlag(_isOnline);
     _startLocationWatch();
     _listenOrders();
   }
@@ -114,8 +116,14 @@ class _CourierDashboardState extends State<CourierDashboard> {
     _posSub = null;
   }
 
+  void _setOnlineFlag(bool v) {
+    db.collection('users').doc(user.id).update({'isOnline': v}).catchError((_) {});
+  }
+
   void _toggleOnline() {
     setState(() => _isOnline = !_isOnline);
+    _setOnlineFlag(_isOnline);
+    _listenOrders();
     if (_isOnline) {
       _startLocationWatch();
     } else {
@@ -150,14 +158,37 @@ class _CourierDashboardState extends State<CourierDashboard> {
   }
 
   void _listenOrders() {
-    if (!_isOnline || user.status != UserStatus.approved) return;
+    _subAvailable?.cancel();
+    if (!_isOnline || user.status != UserStatus.approved) {
+      // أوفلاين: بنوقف الطلبات الجديدة بس، والمشوار النشط يفضل متابَع.
+      if (mounted) setState(() => _availableOrders = []);
+      return;
+    }
+    _subActive?.cancel();
 
+    var firstPending = true;
     _subAvailable = db
         .collection('orders')
         .where('status', isEqualTo: OrderStatus.pending.value)
         .snapshots()
         .listen((snap) {
       if (!mounted) return;
+      if (firstPending) {
+        firstPending = false;
+      } else {
+        for (final ch in snap.docChanges) {
+          if (ch.type != DocumentChangeType.added) continue;
+          final m = ch.doc.data();
+          if (m == null) continue;
+          final o = Order.fromMap(stripFirestore(m) as Map<String, dynamic>, ch.doc.id);
+          NotificationService.show(
+            key: 'order_${o.id}',
+            title: 'طلب جديد 🛵',
+            body:
+                '${o.restaurantName ?? o.pickup.villageName ?? "مشوار"} ← ${o.dropoff.villageName ?? ""} • ${o.price.toInt()} ج.م',
+          );
+        }
+      }
       setState(() {
         _availableOrders = snap.docs
             .map((d) => Order.fromMap(
@@ -228,7 +259,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
       final rating = (userData?['rating'] as num?)?.toDouble() ?? 5.0;
       final photo = userData?['photoURL'] as String?;
 
-      await db.collection('offers').add({
+      final offerRef = await db.collection('offers').add({
         'orderId': orderId,
         'driverId': user.id,
         'driverName': user.name,
@@ -239,6 +270,17 @@ class _CourierDashboardState extends State<CourierDashboard> {
         'price': price,
         'createdAt': DateTime.now().millisecondsSinceEpoch,
       });
+      final target = _availableOrders.where((o) => o.id == orderId).toList();
+      if (target.isNotEmpty) {
+        await NotificationService.notifyUser(
+          userId: target.first.customerId,
+          title: 'وصلك عرض سعر جديد 💰',
+          body: 'الكابتن ${user.name} عرض ${price.toInt()} ج.م على طلبك',
+          type: 'SUCCESS',
+          key: 'offer_${offerRef.id}',
+          orderId: orderId,
+        );
+      }
       setState(() {
         _showOfferInputFor = null;
         _offerPriceCtrl.clear();

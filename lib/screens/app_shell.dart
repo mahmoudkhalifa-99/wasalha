@@ -11,6 +11,8 @@ import '../app_router.dart';
 import '../constants.dart';
 import '../models/models.dart';
 import '../services/firebase_service.dart';
+import '../services/notification_service.dart';
+import '../services/permission_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
 import '../theme/app_text.dart';
@@ -59,6 +61,9 @@ class _AppShellState extends State<AppShell> {
   void initState() {
     super.initState();
     _listenAuth();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) PermissionService.requestOnFirstLaunch(context);
+    });
   }
 
   @override
@@ -67,6 +72,7 @@ class _AppShellState extends State<AppShell> {
     _userSub?.cancel();
     _notifSub?.cancel();
     _tokenSub?.cancel();
+    NotificationService.stop();
     super.dispose();
   }
 
@@ -79,6 +85,7 @@ class _AppShellState extends State<AppShell> {
         } else {
           _userSub?.cancel();
           _notifSub?.cancel();
+          NotificationService.stop();
           if (!mounted) return;
           setState(() {
             _user = null;
@@ -130,6 +137,7 @@ class _AppShellState extends State<AppShell> {
         });
 
         _setupPush(data.id);
+        NotificationService.startFor(data.id, data.role.value);
       } else {
         final currentUser = auth.currentUser;
         if (currentUser != null && currentUser.uid == uid) {

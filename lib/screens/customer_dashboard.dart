@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../config_constants.dart';
 import '../models/models.dart';
 import '../services/firebase_service.dart';
+import '../services/notification_service.dart';
 import '../services/order_service.dart' as order_service;
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
@@ -68,6 +69,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   bool _aiOpen = false;
   bool _showChat = false;
   bool _isSubmitting = false;
+  String? _acceptingOfferId;
 
   int _rating = 5;
   final _feedbackCtrl = TextEditingController();
@@ -274,6 +276,14 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         'acceptedAt': DateTime.now().millisecondsSinceEpoch,
         'price': offer.price,
       });
+      await NotificationService.notifyUser(
+        userId: offer.driverId,
+        title: 'تم قبول عرضك ✅',
+        body: '${user.name} وافق على عرضك ${offer.price.toInt()} ج.م — ابدأ المشوار',
+        type: 'SUCCESS',
+        key: 'accepted_${order.id}',
+        orderId: order.id,
+      );
     } catch (e) {
       if (mounted) showAppAlert(context, 'فشل قبول العرض');
     }
@@ -332,7 +342,16 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         if (prescriptionImage != null) 'prescriptionImage': prescriptionImage,
       };
 
-      await order_service.createOrder(orderData);
+      final newOrderId = await order_service.createOrder(orderData);
+      await NotificationService.notifyUser(
+        userId: UserRole.driver.value,
+        title: 'طلب جديد 🛵',
+        body:
+            '${orderPickup?.villageName ?? "مشوار"} ← ${finalVillage.name} • ${orderPrice.toInt()} ج.م',
+        type: 'ALERT',
+        key: 'order_$newOrderId',
+        orderId: newOrderId,
+      );
 
       // بناء رسالة واتساب تفصيلية وشاملة (نفس نص نسخة الويب بالظبط)
       final catLabel = _selectedCategory == OrderCategory.taxi
@@ -1172,9 +1191,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     // OrderStatus (القيم الحقيقية: DRAFT/PENDING/ASSIGNED/PICKED/IN_DELIVERY/
     // DELIVERED/CANCELLED) — فالشرط ده دايماً false في الأصل، فالتصميم هنا
     // بيحافظ على نفس السلوك تماماً (bug-for-bug) بدل ما "يصلحه" من تلقاء نفسه.
-    const alwaysFalseWaitingForOffers = false;
-
-    if (alwaysFalseWaitingForOffers) {
+    if (order.status == OrderStatus.pending) {
       return _waitingForOffersView(order);
     } else if (order.status == OrderStatus.delivered) {
       return _deliveredRatingView(order);
@@ -1183,85 +1200,190 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     }
   }
 
-  Widget _waitingForOffersView(Order order) {
-    return Column(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(48),
-          decoration: BoxDecoration(
-            color: C.white,
-            shape: BoxShape.circle,
-            border: Border.all(color: C.emerald50, width: 4),
-            boxShadow: Sh.xxl(color: C.emerald900.withOpacity(0.1)),
-          ),
-          child: Pulse(
-              child: const Icon(LucideIcons.radar, size: 80, color: C.emerald600)),
-        ),
-        const SizedBox(height: 24),
-        Text('جاري البحث عن كباتن متاحين...',
-            textAlign: TextAlign.center,
-            style: T.s(24, T.w900, C.slate900, letterSpacing: -0.6)),
-        const SizedBox(height: 4),
-        Text('ستظهر العروض في الأسفل خلال لحظات',
-            style: T.s(11, T.w700, C.slate400)),
-        const SizedBox(height: 24),
-        for (final offer in _incomingOffers)
-          Container(
-            margin: const EdgeInsets.only(bottom: 16),
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: C.white,
-              borderRadius: BorderRadius.circular(32),
-              border: Border.all(color: C.emerald50, width: 2),
-              boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.06)),
+  /// عروض الأسعار: أحدث عرض لكل كابتن، مرتبة من الأرخص، والعميل بيختار.
+  List<Offer> get _sortedOffers {
+    final latest = <String, Offer>{};
+    for (final o in _incomingOffers) {
+      final prev = latest[o.driverId];
+      if (prev == null || o.createdAt >= prev.createdAt) latest[o.driverId] = o;
+    }
+    final list = latest.values.toList()
+      ..sort((a, b) => a.price.compareTo(b.price));
+    return list;
+  }
+
+  Future<void> _acceptOfferTapped(Offer offer) async {
+    if (_acceptingOfferId != null) return;
+    setState(() => _acceptingOfferId = offer.id);
+    try {
+      await _handleAcceptOffer(offer);
+    } finally {
+      if (mounted) setState(() => _acceptingOfferId = null);
+    }
+  }
+
+  Future<void> _cancelPendingOrder(Order order) async {
+    try {
+      await order_service.updateOrderStatus(
+          order.id, OrderStatus.cancelled, user.id, user.role);
+    } catch (_) {
+      if (mounted) showAppAlert(context, 'تعذر إلغاء الطلب');
+    }
+  }
+
+  Widget _offerCard(Offer offer, {required bool cheapest, required Order order}) {
+    final busy = _acceptingOfferId == offer.id;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: C.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+            color: cheapest ? C.emerald500 : C.slate100,
+            width: cheapest ? 2 : 1),
+        boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.05)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (cheapest)
+            Align(
+              alignment: Alignment.centerRight,
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                    color: C.emerald50,
+                    borderRadius: BorderRadius.circular(999)),
+                child: Text('الأقل سعراً',
+                    style: T.s(10, T.w900, C.emerald600)),
+              ),
             ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                PressScale(
-                  onTap: () => _handleAcceptOffer(offer),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 24, vertical: 12),
-                    decoration: BoxDecoration(
-                      color: C.emerald600,
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: Sh.lg(),
-                    ),
-                    child: Text('قبول ${offer.price.toInt()} ج.م',
-                        style: T.s(11, T.w900, C.white)),
-                  ),
-                ),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
+          Row(
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(
+                    color: C.slate50, borderRadius: BorderRadius.circular(16)),
+                child: offer.driverPhoto != null
+                    ? Image.network(offer.driverPhoto!,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => const Icon(
+                            LucideIcons.user, color: C.slate400))
+                    : const Icon(LucideIcons.user, color: C.slate400),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(offer.driverName, style: T.s(14, T.w900, C.slate900)),
-                    const SizedBox(height: 4),
+                    Text(offer.driverName,
+                        style: T.s(14, T.w900, C.slate900)),
+                    const SizedBox(height: 2),
                     Row(
-                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(offer.driverRating > 0
-                                ? offer.driverRating.toStringAsFixed(1)
-                                : '5.0',
-                            style: T.s(10, T.w900, C.amber500)),
-                        const SizedBox(width: 2),
                         const Icon(LucideIcons.star,
                             size: 12, color: C.amber400),
+                        const SizedBox(width: 3),
+                        Text(
+                            offer.driverRating > 0
+                                ? offer.driverRating.toStringAsFixed(1)
+                                : '5.0',
+                            style: T.s(11, T.w900, C.amber500)),
+                        const SizedBox(width: 8),
+                        Text(offer.vehicleType.value,
+                            style: T.s(10, T.w700, C.slate400)),
                       ],
                     ),
                   ],
                 ),
-              ],
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text('${offer.price.toInt()}',
+                      style: T.s(26, T.w900, C.slate950)),
+                  Text('ج.م', style: T.s(10, T.w700, C.slate400)),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          PressScale(
+            onTap: _acceptingOfferId != null ? null : () => _acceptOfferTapped(offer),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: C.emerald600,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: Sh.lg(),
+              ),
+              child: busy
+                  ? const Spinner()
+                  : Text('قبول هذا السعر (${offer.price.toInt()} ج.م)',
+                      style: T.s(13, T.w900, C.white)),
             ),
           ),
-        const SizedBox(height: 16),
+        ],
+      ),
+    );
+  }
+
+  Widget _waitingForOffersView(Order order) {
+    final offers = _sortedOffers;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: C.white,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: C.emerald50, width: 3),
+            boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.08)),
+          ),
+          child: Column(
+            children: [
+              Pulse(
+                  child: const Icon(LucideIcons.radar,
+                      size: 56, color: C.emerald600)),
+              const SizedBox(height: 12),
+              Text(
+                  offers.isEmpty
+                      ? 'جاري إرسال طلبك للكباتن...'
+                      : 'وصلك ${offers.length} عرض — اختار السعر المناسب',
+                  textAlign: TextAlign.center,
+                  style: T.s(18, T.w900, C.slate900)),
+              const SizedBox(height: 6),
+              Text('سعرك المقترح: ${order.price.toInt()} ج.م',
+                  style: T.s(12, T.w700, C.slate500)),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        if (offers.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Text('هتظهر العروض هنا أول ما الكباتن يردوا — هيجيلك إشعار.',
+                textAlign: TextAlign.center,
+                style: T.s(12, T.w500, C.slate400)),
+          ),
+        for (var i = 0; i < offers.length; i++)
+          _offerCard(offers[i], cheapest: i == 0 && offers.length > 1, order: order),
+        const SizedBox(height: 8),
         GestureDetector(
-          onTap: () => db
-              .collection('orders')
-              .doc(order.id)
-              .update({'status': OrderStatus.cancelled.value}),
-          child: Text('إلغاء الطلب',
-              style: T.s(11, T.w900, C.rose500, letterSpacing: 1.2)),
+          onTap: () => _cancelPendingOrder(order),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Text('إلغاء الطلب',
+                textAlign: TextAlign.center,
+                style: T.s(12, T.w900, C.rose500, letterSpacing: 1.2)),
+          ),
         ),
       ],
     );
@@ -1373,10 +1495,10 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
       children: [
         if (_driverLoc != null) ...[
           Container(
-            height: MediaQuery.of(context).size.height * 0.45,
+            height: MediaQuery.of(context).size.height * 0.42,
             clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(72),
+              borderRadius: BorderRadius.circular(28),
               border: Border.all(color: C.white, width: 4),
               boxShadow: Sh.xxl(),
             ),
@@ -1391,12 +1513,14 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                         ? pickupPointMarker(
                             ll.LatLng(order.pickup.lat, order.pickup.lng))
                         : customerHomeMarker(
-                            ll.LatLng(order.pickup.lat, order.pickup.lng)),
+                            ll.LatLng(order.dropoff.lat, order.dropoff.lng)),
                   ],
                   routeGeometry: _routeGeometry,
                   fitPoints: [
                     _driverLoc!,
-                    ll.LatLng(order.pickup.lat, order.pickup.lng),
+                    order.status == OrderStatus.assigned
+                        ? ll.LatLng(order.pickup.lat, order.pickup.lng)
+                        : ll.LatLng(order.dropoff.lat, order.dropoff.lng),
                   ],
                 ),
                 Positioned(

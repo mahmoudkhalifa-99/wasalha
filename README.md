@@ -45,3 +45,9 @@ flutter run --dart-define=GEMINI_API_KEY=your_key   # المفتاح مطلوب 
 - `file_selector` لاختيار الصور (روشتة الصيدلية، صورة البروفايل)
 - `geolocator` لتتبع موقع الكابتن الحي (بديل navigator.geolocation.watchPosition)
 - `http` لطلبات OSRM (المسار الفعلي) و Gemini API
+
+## الإشعارات والأذونات (تحديث)
+- أول فتح للتطبيق: شاشة شرح ثم طلب إذن الإشعارات والموقع (`lib/services/permission_service.dart`).
+- إشعارات محلية + FCM + مستمع Firestore (`lib/services/notification_service.dart`).
+- العميل بيطلب مشوار ← الكباتن الأونلاين بيوصلهم إشعار. الكابتن يقدّم سعر ← العميل بيوصله إشعار ويختار الأنسب.
+- للإشعارات والتطبيق مقفول: انشر الـ Cloud Function في `functions/` (شوف `functions/README.md`).
