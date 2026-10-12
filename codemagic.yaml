@@ -1,4 +1,4 @@
-# إعداد Codemagic لتطبيق وصلها (Flutter) - Android فقط
+# إعداد Codemagic لتطبيق وصلها (Flutter) - Android
 #
 # قبل ما تستخدم الملف ده، لازم:
 # 1) تشغّل `flutter create --org com.wasalah .` محليًا وترفع android/ على Git
@@ -15,7 +15,7 @@ workflows:
     environment:
       flutter: stable
       groups:
-        - wasalah_env
+        - Wasalha
       vars:
         PACKAGE_NAME: "com.wasalah.app"
     scripts:
@@ -28,8 +28,21 @@ workflows:
             echo "مجلد android موجود بالفعل"
           fi
 
+      # flutter create بيولّد test/widget_test.dart الافتراضي (بيشير لـ MyApp اللي مش
+      # موجود عندنا) فبيكسر flutter analyze و flutter test. بنشيله لو هو الملف
+      # الافتراضي بس (أي widget_test حقيقي في الريبو مبيتلمسش).
+      - name: حذف widget_test الافتراضي الناتج عن flutter create
+        script: |
+          if [ -f test/widget_test.dart ] && grep -q "const MyApp()" test/widget_test.dart; then
+            rm -f test/widget_test.dart
+            echo "اتحذف test/widget_test.dart الافتراضي"
+          fi
+
       - name: تطبيق إعدادات وصلها على مشروع الأندرويد (applicationId + صلاحيات + أيقونات)
         script: |
+          if [ -n "${GOOGLE_SERVICES_JSON:-}" ]; then
+            echo "$GOOGLE_SERVICES_JSON" | base64 --decode > android_overrides/google-services.json
+          fi
           python3 tools/patch_android.py
 
       - name: إعداد توقيع الـ Release (keystore ثابت)
@@ -149,23 +162,45 @@ workflows:
       - name: تثبيت الباكدجات
         script: flutter pub get
 
+      # ===================== مراحل التحقق (قبل أي Release) =====================
+      # كل مرحلة أمر واحد: أي exit code غير صفري = الـ workflow يفشل ومبينتقلش
+      # لأي مرحلة بعدها (لا لـ Release APK ولا App Bundle).
+      #
+      # التحليل على مرحلتين:
+      #  1) الموديول (core/map + features/tracking + test/tracking): صارم بالكامل
+      #     (أي info/warning يفشل) لأننا بنملكه ونظيف.
+      #  2) المشروع كله: بيفشل على الأخطاء (errors) بس. فيه ~250 ملاحظة قديمة
+      #     برّه الموديول (معظمها withOpacity المهجور) — بنعالجها لاحقًا وبعدين
+      #     نشدّد المرحلة دي بإزالة --no-fatal-*.
+      - name: تحليل الموديول بصرامة (flutter analyze)
+        script: flutter analyze lib/core/map lib/features/tracking test/tracking
+
+      - name: تحليل المشروع كله - أخطاء فقط (flutter analyze)
+        script: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: تشغيل الاختبارات (flutter test)
+        script: flutter test
+
+      - name: بناء Debug APK للتحقق (flutter build apk --debug)
+        script: flutter build apk --debug --dart-define=PUSH_RELAY_URL=${PUSH_RELAY_URL:-}
+
+      # الـ Debug APK للتحقق فقط — بنشيله عشان ما يتحطش في الـ artifacts جنب الـ Release.
+      - name: حذف Debug APK من المخرجات
+        script: rm -f build/app/outputs/flutter-apk/app-debug.apk*
+      # ===================== نهاية مراحل التحقق =====================
+
       - name: توليد أيقونة التطبيق (launcher icon)
         script: |
+          # أي ملف flutter_launcher_icons-<اسم>.yaml قديم في الجذر بتعتبره المكتبة
+          # flavor (زي iOS) وبيفشل البناء لأن مفيش مجلد ios. بنمسحه قبل التوليد.
+          rm -f flutter_launcher_icons-*.yaml
           dart run flutter_launcher_icons
 
-      - name: حقن مفتاح Gemini (لو موجود كمتغيّر بيئة)
-        script: |
-          if [ -n "${GEMINI_API_KEY:-}" ]; then
-            sed -i "s/YOUR_GEMINI_API_KEY_HERE/${GEMINI_API_KEY}/" lib/config/ai_config.dart
-          else
-            echo "تنبيه: GEMINI_API_KEY مش موجود كمتغيّر بيئة - المساعد الذكي هيفضل معطّل"
-          fi
-
       - name: بناء APK
-        script: flutter build apk --release
+        script: flutter build apk --release --dart-define=PUSH_RELAY_URL=${PUSH_RELAY_URL:-}
 
       - name: بناء App Bundle (للنشر على Google Play)
-        script: flutter build appbundle --release
+        script: flutter build appbundle --release --dart-define=PUSH_RELAY_URL=${PUSH_RELAY_URL:-}
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
       - build/app/outputs/bundle/release/*.aab
