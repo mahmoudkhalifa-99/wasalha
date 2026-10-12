@@ -5,13 +5,20 @@ import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 import 'package:firebase_auth/firebase_auth.dart' as fb;
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../app_router.dart';
 import '../constants.dart';
 import '../models/models.dart';
+import '../services/back_interceptor.dart';
+import '../services/account_deletion_service.dart';
+import '../services/app_status_service.dart';
 import '../services/firebase_service.dart';
+import '../services/geo_service.dart';
+import '../services/remembered_login.dart';
 import '../services/notification_service.dart';
+import '../services/onboarding_prefs.dart';
 import '../services/permission_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
@@ -28,8 +35,13 @@ import 'admin/super_admin_dashboard.dart';
 import 'courier_dashboard.dart';
 import 'customer_dashboard.dart';
 import 'login_screen.dart';
+import 'onboarding_screen.dart';
 import 'notifications_view.dart';
 import 'support_view.dart';
+import 'complete_phone_screen.dart';
+import 'app_disabled_screen.dart';
+import 'suspended_screen.dart';
+import 'verify_email_screen.dart';
 
 /// نسخة Flutter من pages/App.tsx
 class AppShell extends StatefulWidget {
@@ -43,6 +55,14 @@ class _AppShellState extends State<AppShell> {
   AppUser? _user;
   bool _loading = true;
   bool _connectionError = false;
+  // لو القواعد رفضت إنشاء وثيقة المستخدم: نحاول مرة واحدة بس ونعرض شاشة خطأ
+  // بدل ما الشاشة تفضل تترعش (الكتابة المحلية بتظهر الوثيقة ثم السيرفر يرفضها ويتكرر).
+  String? _provisionAttemptedUid;
+  bool _accountError = false;
+  // مستخدم جوجل جديد لازم يختار (عميل / كابتن) قبل إنشاء وثيقته
+  ({String uid, String email, String displayName})? _pendingProfile;
+  // الترحيب أول مرة بعد التثبيت بس (قبل أي شاشة تانية، سواء فيه جلسة محفوظة أو لأ)
+  bool _showOnboarding = !OnboardingPrefs.seen;
   bool _showNotifications = false;
   bool _showSupport = false;
   int _unreadCount = 0;
@@ -55,14 +75,22 @@ class _AppShellState extends State<AppShell> {
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userSub;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _notifSub;
   StreamSubscription<String>? _tokenSub;
+  // تفعيل/تعطيل التطبيق من السوبر أدمن (config/app)
+  StreamSubscription<AppStatus>? _appStatusSub;
+  AppStatus _appStatus = const AppStatus();
   String? _pushForUserId;
+  String? _notifKey;
+  String _userSig = '';
 
   @override
   void initState() {
     super.initState();
     _listenAuth();
+    _appStatusSub = appStatusStream().listen((st) {
+      if (mounted) setState(() => _appStatus = st);
+    }, onError: (e) => debugPrint('app status stream: $e'));
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) PermissionService.requestOnFirstLaunch(context);
+      if (mounted) PermissionService.requestOnFirstLaunch();
     });
   }
 
@@ -72,6 +100,7 @@ class _AppShellState extends State<AppShell> {
     _userSub?.cancel();
     _notifSub?.cancel();
     _tokenSub?.cancel();
+    _appStatusSub?.cancel();
     NotificationService.stop();
     super.dispose();
   }
@@ -81,14 +110,21 @@ class _AppShellState extends State<AppShell> {
     _authSub = auth.authStateChanges().listen((fbUser) async {
       try {
         if (fbUser != null) {
+          GeoService.start();
           _fetchUserData(fbUser.uid);
         } else {
           _userSub?.cancel();
           _notifSub?.cancel();
+          _notifKey = null;
+          _userSig = '';
+          _provisionAttemptedUid = null;
+          _pendingProfile = null;
           NotificationService.stop();
+          GeoService.stop();
           if (!mounted) return;
           setState(() {
             _user = null;
+            _accountError = false;
             _loading = false;
           });
         }
@@ -114,15 +150,29 @@ class _AppShellState extends State<AppShell> {
     final userRef = db.collection('users').doc(uid);
     _userSub = userRef.snapshots().listen((docSnap) async {
       if (docSnap.exists) {
-        final data = AppUser.fromMap(
-            stripFirestore(docSnap.data()) as Map<String, dynamic>, docSnap.id);
+        final raw = stripFirestore(docSnap.data()) as Map<String, dynamic>;
+        final data = AppUser.fromMap(raw, docSnap.id);
         if (!mounted) return;
-        setState(() {
-          _user = data;
-          _loading = false;
-          _connectionError = false;
-        });
+        _provisionAttemptedUid = null;
+        _pendingProfile = null;
+        if (_accountError) setState(() => _accountError = false);
+        // موقع الكابتن بيتكتب كل ~10 متر: ما نعيدش بناء التطبيق كله بسببه.
+        final sig = (Map<String, dynamic>.of(raw)
+              ..remove('location')
+              ..remove('lastTokenUpdate'))
+            .toString();
+        if (_user == null || sig != _userSig || _loading || _connectionError) {
+          _userSig = sig;
+          setState(() {
+            _user = data;
+            _loading = false;
+            _connectionError = false;
+          });
+        }
 
+        final notifKey = '${data.id}|${data.role.value}';
+        if (_notifKey != notifKey) {
+          _notifKey = notifKey;
         _notifSub?.cancel();
         _notifSub = db
             .collection('notifications')
@@ -132,17 +182,69 @@ class _AppShellState extends State<AppShell> {
           final unread =
               snap.docs.where((d) => d.data()['read'] != true).length;
           if (mounted) setState(() => _unreadCount = unread);
+          NotificationService.handleSnapshot(snap, data.id);
         }, onError: (err) {
           debugPrint('Notifications listener: $err');
         });
+        }
 
         _setupPush(data.id);
         NotificationService.startFor(data.id, data.role.value);
       } else {
+        // حذف حساب شغال: ما نعيدش إنشاء الوثيقة اللي لسه ماسحينها
+        if (accountDeletionInProgress) return;
         final currentUser = auth.currentUser;
+        if (_provisionAttemptedUid == uid) {
+          // المحاولة السابقة اترفضت: نوقف التكرار ونعرض الخطأ
+          if (mounted) {
+            setState(() {
+              _user = null;
+              _accountError = true;
+              _loading = false;
+            });
+          }
+          return;
+        }
         if (currentUser != null && currentUser.uid == uid) {
           final emailLower = (currentUser.email ?? '').toLowerCase();
           final isAdminEmail = adminEmails.contains(emailLower);
+
+          if (!isAdminEmail) {
+            // مستخدم جوجل جديد: ما نعملوش حساب عميل تلقائي، نسيبه يختار
+            // (عميل / كابتن) ونوع المركبة من نموذج إكمال البيانات.
+            final isGoogle = currentUser.providerData
+                .any((p) => p.providerId == 'google.com');
+            if (isGoogle) {
+              if (mounted) {
+                setState(() {
+                  _pendingProfile = (
+                    uid: uid,
+                    email: currentUser.email ?? '',
+                    displayName: currentUser.displayName ?? ''
+                  );
+                  _user = null;
+                  _loading = false;
+                });
+              }
+              return;
+            }
+            // تسجيل جديد بالإيميل لسه شغال: شاشة التسجيل هي اللي بتكتب
+            // الوثيقة بالرتبة المختارة، فما نسبقهاش.
+            final created = currentUser.metadata.creationTime;
+            if (created != null &&
+                DateTime.now().difference(created) <
+                    const Duration(minutes: 2)) {
+              if (mounted) {
+                setState(() {
+                  _user = null;
+                  _loading = false;
+                });
+              }
+              return;
+            }
+          }
+
+          _provisionAttemptedUid = uid;
 
           final defaultUserData = AppUser(
             id: uid,
@@ -150,18 +252,23 @@ class _AppShellState extends State<AppShell> {
             name: isAdminEmail
                 ? 'مدير المنظومة'
                 : (currentUser.displayName ?? 'مستخدم'),
-            phone: '01000000000',
+            phone: '', // الرقم إجباري: بتطلبه شاشة إكمال الرقم
             role: isAdminEmail ? UserRole.admin : UserRole.customer,
             status: UserStatus.approved,
             zoneId: 'أشمون',
-            wallet: const Wallet(balance: 1000, totalEarnings: 0, withdrawn: 0),
+            wallet: const Wallet(balance: 0, totalEarnings: 0, withdrawn: 0),
           );
           try {
             await userRef.set(defaultUserData.toMap());
             if (mounted) setState(() => _user = defaultUserData);
           } catch (err) {
             debugPrint('Auto user creation error: $err');
-            if (mounted) setState(() => _user = null);
+            if (mounted) {
+              setState(() {
+                _user = null;
+                _accountError = true;
+              });
+            }
           }
         } else {
           if (mounted) setState(() => _user = null);
@@ -216,9 +323,12 @@ class _AppShellState extends State<AppShell> {
 
   Future<void> _handleLogout() async {
     setState(() => _isLogoutModalOpen = false);
+    await RememberedLogin.clear(); // تسجيل خروج صريح = ننسى الدخول المحفوظ
     await auth.signOut();
     _userSub?.cancel();
     _notifSub?.cancel();
+    _notifKey = null;
+    _userSig = '';
     _pushForUserId = null;
     if (!mounted) return;
     setState(() {
@@ -245,17 +355,56 @@ class _AppShellState extends State<AppShell> {
 
   @override
   Widget build(BuildContext context) {
+    if (_showOnboarding) {
+      return OnboardingScreen(onComplete: () {
+        OnboardingPrefs.markSeen();
+        setState(() => _showOnboarding = false);
+      });
+    }
     if (_loading) return _loadingScreen(context);
     if (_connectionError) return _connectionErrorScreen();
+    if (_accountError) return _accountErrorScreen();
     if (_user == null) {
-      return LoginScreen(onLogin: (u) => setState(() => _user = u));
+      return LoginScreen(
+        onLogin: (u) => setState(() => _user = u),
+        completeProfileFor: _pendingProfile,
+      );
+    }
+    // التطبيق معطّل من السوبر أدمن: كله يقف ما عدا حساب السوبر أدمن
+    if (!_appStatus.enabled && _user!.role != UserRole.admin) {
+      return AppDisabledScreen(
+          message: _appStatus.displayMessage, onLogout: _handleLogout);
+    }
+    // لازم يأكد البريد الأول (حسابات الإيميل/الباسورد فقط، الأدمن وجوجل مستثنين)
+    if (needsEmailVerification(auth.currentUser)) {
+      return VerifyEmailScreen(
+        onVerified: () {
+          if (mounted) setState(() {});
+        },
+        onLogout: _handleLogout,
+      );
+    }
+    // حساب معطّل: مفيش استخدام، ومحدش يرجّعه غير المطوّر
+    if (_user!.status == UserStatus.suspended) {
+      return SuspendedScreen(name: _user!.name, onLogout: _handleLogout);
+    }
+    // رقم الهاتف إجباري لكل الحسابات (جوجل وغيره) ما عدا المستثنين
+    if (!isExemptEmail(_user!.email) && !isValidPhone(_user!.phone)) {
+      return CompletePhoneScreen(
+          userId: _user!.id, name: _user!.name, onLogout: _handleLogout);
     }
 
     final md = isMd(context);
     final headerHeight = md ? 84.0 : 68.0;
     final top = MediaQuery.of(context).padding.top;
 
-    return AppRouter(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _handleBack();
+      },
+      child: AppRouter(
       location: _location,
       go: (path) => setState(() {
         if (path == '/') {
@@ -285,7 +434,44 @@ class _AppShellState extends State<AppShell> {
           ],
         ),
       ),
-    );
+    ));
+  }
+
+  DateTime? _lastBack;
+
+  void _handleBack() {
+    if (_isLogoutModalOpen) {
+      setState(() => _isLogoutModalOpen = false);
+      return;
+    }
+    if (_showNotifications || _showSupport) {
+      setState(() {
+        _showNotifications = false;
+        _showSupport = false;
+      });
+      return;
+    }
+    if (_stack.length > 1) {
+      setState(() => _stack.removeLast());
+      return;
+    }
+    if (BackInterceptor.handle()) return;
+    // الصفحة الرئيسية: ضغطتين رجوع للخروج
+    final now = DateTime.now();
+    if (_lastBack == null || now.difference(_lastBack!) > const Duration(seconds: 2)) {
+      _lastBack = now;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          content: Text('اضغط رجوع مرة تانية للخروج',
+              textAlign: TextAlign.center,
+              style: T.s(13, T.w700, C.white)),
+        ));
+      return;
+    }
+    SystemNavigator.pop();
   }
 
   Widget _content() {
@@ -710,6 +896,58 @@ class _AppShellState extends State<AppShell> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _accountErrorScreen() {
+    return Scaffold(
+      backgroundColor: C.slate50,
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(40),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: C.rose50,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Icon(LucideIcons.xCircle,
+                    size: 40, color: C.rose500),
+              ),
+              const SizedBox(height: 24),
+              Text('تعذر إنشاء ملف حسابك',
+                  textAlign: TextAlign.center,
+                  style: T.s(22, T.w900, C.slate800)),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 320),
+                child: Text(
+                    'السيرفر رفض إنشاء بيانات الحساب. سجّل الخروج وحاول تاني، ولو المشكلة مستمرة كلّم الدعم.',
+                    textAlign: TextAlign.center,
+                    style: T.s(12, T.w700, C.slate400)),
+              ),
+              const SizedBox(height: 24),
+              PressScale(
+                onTap: _handleLogout,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                  decoration: BoxDecoration(
+                    color: C.emerald600,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Text('تسجيل الخروج',
+                      style: T.s(16, T.w900, C.white)),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

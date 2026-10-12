@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' as intl;
@@ -145,6 +144,7 @@ class _NotificationsViewState extends State<NotificationsView> {
   IconData _typeIcon(String type) {
     if (type == 'SUCCESS') return LucideIcons.checkCircle;
     if (type == 'ALERT') return LucideIcons.bell;
+    if (type == 'ADMIN_MESSAGE') return LucideIcons.megaphone;
     return LucideIcons.info;
   }
 

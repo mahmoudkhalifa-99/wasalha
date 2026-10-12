@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
+import 'package:flutter/foundation.dart' show setEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -8,7 +9,12 @@ import 'package:latlong2/latlong.dart' as ll;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../features/tracking/models/tracking_models.dart' show GeoFix;
+import '../features/tracking/services/driver_location_source.dart';
+import '../features/verification/ui/verification_banner.dart';
 import '../models/models.dart';
+import '../pricing.dart';
+import '../services/back_interceptor.dart';
 import '../services/firebase_service.dart';
 import '../services/notification_service.dart';
 import '../services/order_service.dart' as order_service;
@@ -16,8 +22,11 @@ import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
 import '../theme/app_text.dart';
 import '../utils.dart' as utils;
+import '../widgets/captains_offers_map.dart' show orderPickupPoint, orderDropoffPoint;
 import '../widgets/common.dart';
+import '../widgets/fare_breakdown.dart';
 import '../widgets/leaflet_map.dart';
+import '../widgets/order_details_panel.dart';
 import 'activity_view.dart';
 import 'chat_view.dart';
 import 'profile_view.dart';
@@ -48,72 +57,231 @@ class _CourierDashboardState extends State<CourierDashboard> {
   List<ll.LatLng> _routeGeometry = [];
 
   StreamSubscription<Position>? _posSub;
-  StreamSubscription? _subCustomer, _subAvailable, _subActive;
+  StreamSubscription? _subCustomer, _subAvailable, _subActive, _subMyOffers;
+
+  // بث الموقع: كتابة واحدة في نفس الوقت وآخر موقع بس (مفيش طابور أوفلاين بيتراكم).
+  late final DriverLocationPublisher _publisher =
+      DriverLocationPublisher(widget.user.id);
+
+  // إعادة محاولة GPS بتباعد تصاعدي (5 ث ← 10 ← 20 ← 40 ← 80 حد أقصى).
+  Timer? _gpsRetryTimer;
+  int _gpsFailures = 0;
+  bool _gpsStarting = false;
+  String? _lastGpsIssue;
+
+  // المسار: طلب واحد في نفس الوقت + تباعد تصاعدي بعد الفشل/429.
+  final utils.RouteBackoff _routeBackoff = utils.RouteBackoff();
+  bool _routeInFlight = false;
+  Timer? _routeRetryTimer;
+
+  // مين يقدر يشوف موقعي: عملاء الطلبات اللي قدّمت عليها عرض + عميل مشواري النشط.
+  Set<String> _myOfferOrderIds = {};
+  Set<String>? _publishedViewers; // null = لسه ما كتبناش (بنكتب أول مرة عشان نمسح القديم)
+  // ما نكتبش قائمة المشاهدين قبل ما العروض والطلبات يحمّلوا (وإلا هنمسحها غلط).
+  bool _offersLoaded = false, _pendingLoaded = false, _activeLoaded = false;
+  bool _viewersSyncing = false;
+  bool _viewersDirty = false;
+  Timer? _viewersRetryTimer;
 
   AppUser get user => widget.user;
 
   @override
   void initState() {
     super.initState();
+    BackInterceptor.register(_onBack);
     _setOnlineFlag(_isOnline);
+    _scrubLegacyLocation();
     _startLocationWatch();
+    _listenMyOffers();
     _listenOrders();
+    // أول ما الكابتن يدخل حسابه: لو التوثيق ناقص تتفتح شاشة التوثيق علطول.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) promptVerificationIfNeeded(context, widget.user);
+    });
   }
 
-  @override
-  void didUpdateWidget(covariant CourierDashboard oldWidget) {
-    super.didUpdateWidget(oldWidget);
+  bool _onBack() {
+    if (_showChat) {
+      setState(() => _showChat = false);
+      return true;
+    }
+    if (_activeView != _CourierView.home) {
+      setState(() => _activeView = _CourierView.home);
+      return true;
+    }
+    return false;
   }
 
   @override
   void dispose() {
+    BackInterceptor.unregister(_onBack);
     _posSub?.cancel();
+    _gpsRetryTimer?.cancel();
+    _routeRetryTimer?.cancel();
+    _viewersRetryTimer?.cancel();
+    _publisher.close();
     _subCustomer?.cancel();
     _subAvailable?.cancel();
     _subActive?.cancel();
+    _subMyOffers?.cancel();
     _offerPriceCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _startLocationWatch() async {
-    if (!_isOnline) return;
+    if (!_isOnline || _gpsStarting || !mounted) return;
+    _gpsStarting = true;
+    _gpsRetryTimer?.cancel();
     try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        _reportGpsIssue('خدمة الموقع (GPS) مقفولة. شغّلها عشان العملاء يشوفوك.');
+        _scheduleGpsRetry(); // ممكن يشغّلها وهو فاتح التطبيق
+        return;
+      }
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
+        // محتاج المستخدم يغيّرها بإيده: مفيش تكرار تلقائي.
+        _reportGpsIssue('إذن الموقع مرفوض. فعّله من إعدادات التطبيق.');
         return;
       }
-      _posSub?.cancel();
+      await _posSub?.cancel();
+      if (!mounted || !_isOnline) return;
       _posSub = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
           distanceFilter: 10,
         ),
-      ).listen((pos) {
-        final newLoc = ll.LatLng(pos.latitude, pos.longitude);
-        if (!mounted) return;
-        setState(() => _currentLocation = newLoc);
-        // تحديث موقع الكابتن في Firestore ليراه العميل
-        db.collection('users').doc(user.id).update({
-          'location': {
-            'lat': newLoc.latitude,
-            'lng': newLoc.longitude,
-            'updatedAt': DateTime.now().millisecondsSinceEpoch,
-          },
-        });
-        _recalcRoute();
-      }, onError: (err) => debugPrint('location error: $err'));
+      ).listen(_onPosition, onError: _onGpsError, cancelOnError: true);
     } catch (err) {
       debugPrint('location watch failed: $err');
+      _scheduleGpsRetry();
+    } finally {
+      _gpsStarting = false;
     }
+  }
+
+  void _onPosition(Position pos) {
+    if (!mounted) return;
+    _gpsFailures = 0;
+    _lastGpsIssue = null;
+    final newLoc = ll.LatLng(pos.latitude, pos.longitude);
+    setState(() => _currentLocation = newLoc);
+    // الـ publisher بيحدّ المعدل وبيكتب موقع واحد في المرة (حتى أوفلاين).
+    _publisher.publish(
+        GeoFix(position: newLoc, updatedAt: DateTime.now(), accuracy: pos.accuracy));
+    _recalcRoute();
+  }
+
+  void _onGpsError(Object err) {
+    debugPrint('location error: $err');
+    _posSub = null; // cancelOnError: الاشتراك اتقفل
+    if (!mounted || !_isOnline) return;
+    if (err is PermissionDeniedException) {
+      _reportGpsIssue('إذن الموقع مرفوض. فعّله من إعدادات التطبيق.');
+      return;
+    }
+    if (err is LocationServiceDisabledException) {
+      _reportGpsIssue('خدمة الموقع (GPS) مقفولة. شغّلها عشان العملاء يشوفوك.');
+    }
+    _scheduleGpsRetry();
+  }
+
+  void _scheduleGpsRetry() {
+    if (!mounted || !_isOnline) return;
+    _gpsFailures++;
+    final exp = _gpsFailures - 1 > 4 ? 4 : _gpsFailures - 1;
+    _gpsRetryTimer?.cancel();
+    _gpsRetryTimer =
+        Timer(Duration(seconds: 5 * (1 << exp)), _startLocationWatch);
+  }
+
+  /// بيظهر كل رسالة مرة واحدة بس (لحد ما الـ GPS يشتغل تاني) عشان مانزعجش الكابتن.
+  void _reportGpsIssue(String msg) {
+    if (!mounted || _lastGpsIssue == msg) return;
+    _lastGpsIssue = msg;
+    showAppAlert(context, msg);
   }
 
   void _stopLocationWatch() {
     _posSub?.cancel();
     _posSub = null;
+    _gpsRetryTimer?.cancel();
+    _gpsFailures = 0;
+    _lastGpsIssue = null;
+  }
+
+  /// نسخ قديمة كانت بتكتب الموقع في users/{id}.location (مقروء لأي مستخدم).
+  /// بنمسحه مرة عند الفتح؛ الموقع دلوقتي في driver_locations بقواعد قراءة مقيّدة.
+  void _scrubLegacyLocation() {
+    db
+        .collection('users')
+        .doc(user.id)
+        .update({'location': FieldValue.delete()}).catchError((_) {});
+  }
+
+  // ── مين يشوف موقعي ──
+
+  void _listenMyOffers() {
+    _subMyOffers?.cancel();
+    _subMyOffers = db
+        .collection('offers')
+        .where('driverId', isEqualTo: user.id)
+        .snapshots()
+        .listen((snap) {
+      _offersLoaded = true;
+      _myOfferOrderIds = {
+        for (final d in snap.docs)
+          if ((d.data()['orderId'] as String?)?.isNotEmpty ?? false)
+            d.data()['orderId'] as String,
+      };
+      _syncViewers();
+    }, onError: (e) =>
+            handleFirestoreError(e, OperationType.list, 'offers (mine)'));
+  }
+
+  Set<String> _desiredViewers() {
+    final s = <String>{};
+    for (final o in _availableOrders) {
+      if (_myOfferOrderIds.contains(o.id) && o.customerId.isNotEmpty) {
+        s.add(o.customerId);
+      }
+    }
+    final a = _activeOrder;
+    if (a != null && a.customerId.isNotEmpty) s.add(a.customerId);
+    return s;
+  }
+
+  /// بيخلّي قائمة `viewers` في driver_locations مطابقة للمطلوب (وبيشيل العملاء
+  /// اللي طلبهم خلص/اتاخد من كابتن تاني). مزامنة واحدة في نفس الوقت.
+  Future<void> _syncViewers() async {
+    if (!mounted) return;
+    if (!(_offersLoaded && _pendingLoaded && _activeLoaded)) return;
+    if (_viewersSyncing) {
+      _viewersDirty = true;
+      return;
+    }
+    _viewersSyncing = true;
+    try {
+      do {
+        _viewersDirty = false;
+        final want = _desiredViewers();
+        final done = _publishedViewers;
+        if (done != null && setEquals(done, want)) continue;
+        final ok = await _publisher.setViewers(want);
+        if (ok) {
+          _publishedViewers = want;
+        } else if (mounted) {
+          _viewersRetryTimer?.cancel();
+          _viewersRetryTimer = Timer(const Duration(seconds: 15), _syncViewers);
+        }
+      } while (_viewersDirty && mounted);
+    } finally {
+      _viewersSyncing = false;
+    }
   }
 
   void _setOnlineFlag(bool v) {
@@ -131,30 +299,123 @@ class _CourierDashboardState extends State<CourierDashboard> {
     }
   }
 
-  Future<void> _recalcRoute() async {
+  DateTime? _lastRouteAt;
+  String? _lastRouteDest;
+
+  /// موقع حقيقي مرة واحدة (آخر معروف ثم الحالي) — عشان الخريطة والمسار
+  /// ميبدأوش من المركز الافتراضي، وعشان تشتغل حتى والكابتن أوفلاين.
+  Future<void> _refreshPosition({bool route = true}) async {
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return;
+      }
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null && mounted) {
+        setState(() =>
+            _currentLocation = ll.LatLng(last.latitude, last.longitude));
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 10),
+        ),
+      );
+      if (!mounted) return;
+      setState(() =>
+          _currentLocation = ll.LatLng(pos.latitude, pos.longitude));
+    } catch (e) {
+      debugPrint('refresh position failed: $e');
+    }
+    if (route && mounted) _recalcRoute(force: true);
+  }
+
+  /// وجهة المسار الحالية، أو null لو مفيش وجهة معروفة. في مرحلة الاستلام
+  /// بنستخدم نقطة الاستلام *الحقيقية* بس: الصيدلية والطلب اليدوي مالهمش مكان
+  /// معروف، فمفيش مسار ولا علامة (بدل ما نوجّه الكابتن لنقطة وهمية).
+  ll.LatLng? _routeDestination(Order order) => order.status == OrderStatus.assigned
+      ? orderPickupPoint(order)
+      : orderDropoffPoint(order);
+
+  Future<void> _recalcRoute({bool force = false}) async {
     final order = _activeOrder;
-    if (order == null) {
-      if (mounted) setState(() => _routeGeometry = []);
+    final dest = order == null ? null : _routeDestination(order);
+    if (order == null || dest == null) {
+      _lastRouteDest = null;
+      _routeRetryTimer?.cancel();
+      _routeBackoff.reset();
+      if (mounted && _routeGeometry.isNotEmpty) setState(() => _routeGeometry = []);
       return;
     }
-    final dest =
-        order.status == OrderStatus.assigned ? order.pickup : order.dropoff;
+    final destKey = '${order.id}|${order.status.value}';
+    final destChanged = destKey != _lastRouteDest;
+    if (destChanged) {
+      // وجهة جديدة: نبدأ من الأول (التباعد القديم كان لوجهة تانية).
+      _routeBackoff.reset();
+      _routeRetryTimer?.cancel();
+    }
+    if (_routeInFlight) return; // طلب واحد في نفس الوقت
+    if (_routeBackoff.blocked) return; // بعد فشل/429: الـ Timer هيعيد المحاولة
+    final now = DateTime.now();
+    // ما نطلبش المسار من الخادم مع كل تحديث GPS: كل 15 ثانية أو لما الوجهة تتغير.
+    if (!force &&
+        !destChanged &&
+        _lastRouteAt != null &&
+        now.difference(_lastRouteAt!) < const Duration(seconds: 15)) {
+      return;
+    }
+    _lastRouteDest = destKey;
+    _lastRouteAt = now;
+    _routeInFlight = true;
+    final info = utils.RouteFetchInfo();
+    var stale = false;
     try {
       final geo = await utils.getRouteGeometry(_currentLocation.latitude,
-          _currentLocation.longitude, dest.lat, dest.lng);
-      if (mounted) {
-        setState(() => _routeGeometry = geo.isNotEmpty
-            ? geo.map((p) => ll.LatLng(p[0], p[1])).toList()
-            : [_currentLocation, ll.LatLng(dest.lat, dest.lng)]);
+          _currentLocation.longitude, dest.latitude, dest.longitude,
+          info: info);
+      if (!mounted) return;
+      final cur = _activeOrder;
+      if (cur == null || '${cur.id}|${cur.status.value}' != destKey) {
+        stale = true; // الطلب/المرحلة اتغيّرت أثناء الانتظار: الرد ده قديم
+      } else if (utils.isStraightFallback(geo)) {
+        // السيرفرات فشلت: منستبدلش طريق حقيقي قديم بخط مستقيم، وبنعيد المحاولة
+        // بتباعد تصاعدي (مش مع كل تحديث GPS).
+        _onRouteFailure(rateLimited: info.rateLimited);
+        if (_routeGeometry.length <= 2) {
+          setState(() => _routeGeometry = geo.isNotEmpty
+              ? geo.map((p) => ll.LatLng(p[0], p[1])).toList()
+              : [_currentLocation, dest]);
+        }
+      } else {
+        _routeBackoff.succeed();
+        _routeRetryTimer?.cancel();
+        setState(() =>
+            _routeGeometry = geo.map((p) => ll.LatLng(p[0], p[1])).toList());
       }
     } catch (_) {
       if (mounted) {
-        setState(() => _routeGeometry = [
-              _currentLocation,
-              ll.LatLng(dest.lat, dest.lng),
-            ]);
+        _onRouteFailure();
+        if (_routeGeometry.length <= 2) {
+          setState(() => _routeGeometry = [_currentLocation, dest]);
+        }
       }
+    } finally {
+      _routeInFlight = false;
     }
+    if (stale && mounted) _recalcRoute(force: true);
+  }
+
+  void _onRouteFailure({bool rateLimited = false}) {
+    final wait = _routeBackoff.fail(rateLimited: rateLimited);
+    _routeRetryTimer?.cancel();
+    // Timer عشان المحاولة تتكرر حتى لو الكابتن واقف (مفيش تحديث GPS جديد).
+    _routeRetryTimer = Timer(wait, () {
+      if (mounted) _recalcRoute(force: true);
+    });
   }
 
   void _listenOrders() {
@@ -162,6 +423,8 @@ class _CourierDashboardState extends State<CourierDashboard> {
     if (!_isOnline || user.status != UserStatus.approved) {
       // أوفلاين: بنوقف الطلبات الجديدة بس، والمشوار النشط يفضل متابَع.
       if (mounted) setState(() => _availableOrders = []);
+      _pendingLoaded = true;
+      _syncViewers();
       return;
     }
     _subActive?.cancel();
@@ -195,6 +458,8 @@ class _CourierDashboardState extends State<CourierDashboard> {
                 stripFirestore(d.data()) as Map<String, dynamic>, d.id))
             .toList();
       });
+      _pendingLoaded = true;
+      _syncViewers(); // العروض على طلبات اتاخدت/اتلغت: نشيل عملاءها
     }, onError: (e) =>
         handleFirestoreError(e, OperationType.list, 'orders (pending)'));
 
@@ -219,9 +484,12 @@ class _CourierDashboardState extends State<CourierDashboard> {
           active?.status != _activeOrder?.status;
       if (!mounted) return;
       setState(() => _activeOrder = active);
+      _activeLoaded = true;
+      _syncViewers();
       if (changed) {
-        _recalcRoute();
         _listenCustomerLocation();
+        // بنجيب الموقع الحقيقي الأول، وبعدها المسار منه.
+        _refreshPosition();
       }
     }, onError: (e) =>
         handleFirestoreError(e, OperationType.list, 'orders (active_driver)'));
@@ -250,10 +518,18 @@ class _CourierDashboardState extends State<CourierDashboard> {
   }
 
   Future<void> _handleSendOffer(String orderId) async {
-    final price = double.tryParse(_offerPriceCtrl.text);
-    if (price == null || _isSubmitting) return;
+    final typed = double.tryParse(_offerPriceCtrl.text);
+    if (typed == null || _isSubmitting) return;
+    // الحد الأدنى 25 ج.م: أي عرض أقل بيترفع تلقائياً لـ 25
+    final price = finalFare(typed);
     setState(() => _isSubmitting = true);
     try {
+      // رسالة ودّية لو الحساب مش مسموح له يستقبل طلبات (الحجب الفعلي في قواعد Firestore).
+      final blocked = await verificationBlockMessage(user.id);
+      if (blocked != null) {
+        if (mounted) showAppAlert(context, blocked);
+        return;
+      }
       final userSnap = await db.collection('users').doc(user.id).get();
       final userData = userSnap.data();
       final rating = (userData?['rating'] as num?)?.toDouble() ?? 5.0;
@@ -299,9 +575,19 @@ class _CourierDashboardState extends State<CourierDashboard> {
     setState(() => _isSubmitting = true);
     try {
       await order_service.updateOrderStatus(order.id, status, user.id, user.role);
+      if (status == OrderStatus.picked) {
+        await NotificationService.notifyUser(
+          userId: order.customerId,
+          title: 'الكابتن استلم طلبك 🛵',
+          body: 'أول ما يوصلك اضغط "تم الاستلام بالفعل" في التطبيق.',
+          type: 'INFO',
+          key: 'picked_${order.id}',
+          orderId: order.id,
+        );
+      }
     } catch (e) {
       if (mounted) {
-        showAppAlert(context, 'فشل تحديث الحالة: ${e.toString()}');
+        showAppAlert(context, 'فشل تحديث الحالة: ${friendlyError(e)}');
       }
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
@@ -337,18 +623,18 @@ class _CourierDashboardState extends State<CourierDashboard> {
 
     setState(() => _isSubmitting = true);
     try {
-      await order_service.updateOrderStatus(
-          order.id, OrderStatus.pending, user.id, user.role);
-      await db.collection('orders').doc(order.id).update({
-        'driverId': FieldValue.delete(),
-        'driverName': FieldValue.delete(),
-        'driverPhone': FieldValue.delete(),
-        'acceptedAt': FieldValue.delete(),
-        'assignedTo': FieldValue.delete(),
-      });
+      await order_service.releaseOrderFromCourier(order.id, user.id);
+      await NotificationService.notifyUser(
+        userId: order.customerId,
+        title: 'الكابتن اعتذر عن مشوارك',
+        body: 'تم إرجاع طلبك لقائمة العروض — اختار كابتن تاني.',
+        type: 'ALERT',
+        key: 'released_${order.id}_${DateTime.now().millisecondsSinceEpoch}',
+        orderId: order.id,
+      );
       if (mounted) showAppAlert(context, 'تم الاعتذار عن المشوار بنجاح');
     } catch (e) {
-      if (mounted) showAppAlert(context, 'فشل الاعتذار');
+      if (mounted) showAppAlert(context, 'فشل الاعتذار: ${friendlyError(e)}');
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
@@ -358,9 +644,6 @@ class _CourierDashboardState extends State<CourierDashboard> {
 
   @override
   Widget build(BuildContext context) {
-    if (user.status != UserStatus.approved) {
-      return _pendingApprovalScreen();
-    }
     if (_showChat && _activeOrder != null) {
       return ChatView(
         user: user,
@@ -380,7 +663,11 @@ class _CourierDashboardState extends State<CourierDashboard> {
       );
     }
 
+    // fit: expand ضروري: من غيره الـ Stack بيتقلص لحجم أكبر ابن غير موضّع، ولما
+    // تاب الخريطة يتفتح الابن ده بيبقى Offstage (حجمه صفر) فالخريطة بتتحط في
+    // مساحة 0 والشاشة بتبقى فاضية.
     return Stack(
+      fit: StackFit.expand,
       children: [
         Container(
           color: C.slate50,
@@ -396,6 +683,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
+                        VerificationBanner(user: user),
                         _onlineStatusCard(),
                         const SizedBox(height: 32),
                         if (_activeOrder != null)
@@ -413,45 +701,6 @@ class _CourierDashboardState extends State<CourierDashboard> {
         if (_activeView == _CourierView.map) _mapView(context),
         _bottomNav(),
       ],
-    );
-  }
-
-  Widget _pendingApprovalScreen() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(48),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(LucideIcons.shieldAlert, size: 80, color: C.emerald600),
-            const SizedBox(height: 24),
-            Text('حسابك بانتظار التفعيل',
-                textAlign: TextAlign.center,
-                style: T.s(30, T.w900, C.slate900, letterSpacing: -0.6)),
-            const SizedBox(height: 12),
-            Text('يرجى التواصل مع الإدارة للبدء في استقبال الطلبات.',
-                textAlign: TextAlign.center,
-                style: T.s(13, T.w700, C.slate400)),
-            const SizedBox(height: 24),
-            PressScale(
-              onTap: () => launchUrl(Uri.parse('https://wa.me/201065019364'),
-                  mode: LaunchMode.externalApplication),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 24),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF25D366),
-                  borderRadius: BorderRadius.circular(32),
-                  boxShadow: Sh.xl(),
-                ),
-                child: Text('تواصل عبر واتساب',
-                    style: T.s(15, T.w900, C.white)),
-              ),
-            ),
-          ],
-        ),
-      ),
     );
   }
 
@@ -619,6 +868,13 @@ class _CourierDashboardState extends State<CourierDashboard> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 16),
+                // قيمة الرحلة ← العمولة ← صافي المستحق (بنفس قاعدة الحد الأدنى 25)
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: _offerPriceCtrl,
+                  builder: (_, v, __) => FareBreakdownView(
+                      fare: finalFare(double.tryParse(v.text) ?? o.price)),
+                ),
                 const SizedBox(height: 24),
                 Row(
                   children: [
@@ -670,7 +926,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
                         borderRadius: BorderRadius.circular(35),
                         boxShadow: Sh.xxl(),
                       ),
-                      child: Text('${o.price.toInt()}',
+                      child: Text('${finalFare(o.price).toInt()}',
                           style: T.s(30, T.w900, C.emerald400)),
                     ),
                     const SizedBox(width: 16),
@@ -711,64 +967,20 @@ class _CourierDashboardState extends State<CourierDashboard> {
                                 ),
                             ],
                           ),
-                          if (o.foodItems != null || o.specialRequest != null)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 8),
-                              child: Container(
-                                padding: const EdgeInsets.only(top: 8),
-                                decoration: BoxDecoration(
-                                  border: Border(
-                                      top: BorderSide(color: C.slate100)),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: [
-                                    if (o.foodItems != null)
-                                      Text(
-                                          'الأصناف: ${o.foodItems!.map((i) => i.name).join("، ")}',
-                                          textAlign: TextAlign.right,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: T.s(9, T.w700, C.slate400)),
-                                    if (o.specialRequest != null)
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 4),
-                                        child: Container(
-                                          padding: const EdgeInsets.symmetric(
-                                              horizontal: 10, vertical: 4),
-                                          decoration: BoxDecoration(
-                                            color: C.amber50,
-                                            borderRadius:
-                                                BorderRadius.circular(8),
-                                          ),
-                                          child: Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              Text('طلب يدوي خاص متوفر',
-                                                  style: T.s(9, T.w900,
-                                                      C.amber500)),
-                                              const SizedBox(width: 4),
-                                              const Icon(
-                                                  LucideIcons.clipboardList,
-                                                  size: 12,
-                                                  color: C.amber500),
-                                            ],
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ),
+
                         ],
                       ),
                     ),
                   ],
                 ),
+                const SizedBox(height: 16),
+                // تفاصيل الطلب كاملة (بما فيها صورة الروشتة) قبل تقديم العرض
+                OrderDetailsPanel(order: o),
                 const SizedBox(height: 24),
                 PressScale(
                   onTap: () => setState(() {
                     _showOfferInputFor = o.id;
-                    _offerPriceCtrl.text = o.price.toStringAsFixed(0);
+                    _offerPriceCtrl.text = finalFare(o.price).toStringAsFixed(0);
                   }),
                   child: Container(
                     width: double.infinity,
@@ -825,7 +1037,10 @@ class _CourierDashboardState extends State<CourierDashboard> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   PressScale(
-                    onTap: () => setState(() => _activeView = _CourierView.map),
+                    onTap: () {
+                      setState(() => _activeView = _CourierView.map);
+                      _refreshPosition();
+                    },
                     child: Container(
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
@@ -843,13 +1058,15 @@ class _CourierDashboardState extends State<CourierDashboard> {
                           style: T.s(10, T.w900, C.emerald600,
                               letterSpacing: 1.2)),
                       const SizedBox(height: 2),
-                      Text(order.status.value,
+                      Text(order.status.labelAr,
                           style: T.s(20, T.w900, C.slate950)),
                     ],
                   ),
                 ],
               ),
               const SizedBox(height: 20),
+              FareBreakdownView(fare: finalFare(tripFareOf(order))),
+              const SizedBox(height: 16),
               Container(
                 padding: const EdgeInsets.all(20),
                 decoration: BoxDecoration(
@@ -963,6 +1180,17 @@ class _CourierDashboardState extends State<CourierDashboard> {
                   ),
                 ),
               ],
+              if (order.prescriptionImage != null &&
+                  order.prescriptionImage!.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Text('صورة الروشتة / الدواء:',
+                      style: T.s(10, T.w900, C.rose500, letterSpacing: 1.2)),
+                ),
+                const SizedBox(height: 6),
+                PrescriptionPreview(image: order.prescriptionImage!),
+              ],
               const SizedBox(height: 20),
               Row(
                 children: [
@@ -1025,7 +1253,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
                 )
               else if (isPicked)
                 PressScale(
-                  onTap: _isSubmitting
+                  onTap: (_isSubmitting || !order.customerReceived)
                       ? null
                       : () => _updateOrderStatus(OrderStatus.delivered),
                   child: Container(
@@ -1033,14 +1261,20 @@ class _CourierDashboardState extends State<CourierDashboard> {
                     padding: const EdgeInsets.symmetric(vertical: 24),
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: C.emerald600,
+                      color: order.customerReceived ? C.emerald600 : C.slate200,
                       borderRadius: BorderRadius.circular(24),
-                      boxShadow: Sh.xl(color: C.emerald600.withOpacity(0.3)),
+                      boxShadow: order.customerReceived
+                          ? Sh.xl(color: C.emerald600.withOpacity(0.3))
+                          : null,
                     ),
                     child: _isSubmitting
                         ? const Spinner()
-                        : Text('تأكيد التسليم النهائي',
-                            style: T.s(16, T.w900, C.white)),
+                        : Text(
+                            order.customerReceived
+                                ? 'تأكيد التسليم النهائي'
+                                : 'بانتظار تأكيد العميل للاستلام...',
+                            style: T.s(16, T.w900,
+                                order.customerReceived ? C.white : C.slate500)),
                   ),
                 ),
               const SizedBox(height: 8),
@@ -1064,9 +1298,12 @@ class _CourierDashboardState extends State<CourierDashboard> {
 
   Widget _mapView(BuildContext context) {
     final order = _activeOrder;
-    final dest = order == null
-        ? null
-        : (order.status == OrderStatus.assigned ? order.pickup : order.dropoff);
+    final isAssigned = order?.status == OrderStatus.assigned;
+    // نقطة الاستلام الحقيقية فقط (الصيدلية/الطلب اليدوي = null فمفيش علامة غلط).
+    final pickupPt = order == null ? null : orderPickupPoint(order);
+    final dropPt = order == null ? null : orderDropoffPoint(order);
+    // الوجهة اللي بنركّز عليها وبنرسم لها مسار.
+    final dest = order == null ? null : (isAssigned ? pickupPt : dropPt);
 
     return Positioned.fill(
       child: Material(
@@ -1093,15 +1330,18 @@ class _CourierDashboardState extends State<CourierDashboard> {
                         size: 20, color: C.white),
                   ),
                 ),
-                if (dest != null)
-                  order?.status == OrderStatus.assigned
-                      ? pickupPointMarker(ll.LatLng(dest.lat, dest.lng))
-                      : customerHomeMarker(ll.LatLng(dest.lat, dest.lng)),
+                if (isAssigned && pickupPt != null) pickupPointMarker(pickupPt),
+                // مكان العميل: وجهة المشوار بعد الاستلام، ومرجع بس قبله لو مكان
+                // الاستلام مجهول (بدون مسار).
+                if (dropPt != null && (!isAssigned || pickupPt == null))
+                  customerHomeMarker(dropPt),
               ],
               routeGeometry: _routeGeometry,
-              fitPoints: dest == null
+              showControls: true,
+              followCenter: true,
+              fitPoints: (dest ?? dropPt) == null
                   ? null
-                  : [_currentLocation, ll.LatLng(dest.lat, dest.lng)],
+                  : [_currentLocation, (dest ?? dropPt)!],
             ),
             Positioned(
               top: 48,
@@ -1123,7 +1363,7 @@ class _CourierDashboardState extends State<CourierDashboard> {
                           size: 24, color: C.slate900),
                     ),
                   ),
-                  if (dest != null)
+                  if (order != null && (dest != null || isAssigned))
                     Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 20, vertical: 12),
@@ -1133,8 +1373,10 @@ class _CourierDashboardState extends State<CourierDashboard> {
                         boxShadow: Sh.xl(),
                       ),
                       child: Text(
-                          order!.status == OrderStatus.assigned
-                              ? 'الوجهة: نقطة الاستلام'
+                          isAssigned
+                              ? (pickupPt != null
+                                  ? 'الوجهة: نقطة الاستلام'
+                                  : 'نقطة الاستلام غير محددة')
                               : 'الوجهة: العميل',
                           style: T.s(11, T.w900, C.white)),
                     ),
@@ -1174,7 +1416,10 @@ class _CourierDashboardState extends State<CourierDashboard> {
           children: [
             for (final t in tabs)
               GestureDetector(
-                onTap: () => setState(() => _activeView = t.$1),
+                onTap: () {
+                  setState(() => _activeView = t.$1);
+                  if (t.$1 == _CourierView.map) _refreshPosition();
+                },
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [

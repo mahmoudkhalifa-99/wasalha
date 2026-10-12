@@ -1,7 +1,8 @@
 // نسخة Dart من constants.ts — نفس القيم بالظبط.
 import 'models/models.dart';
 
-const double platformCommissionRate = 0.15;
+/// رسوم المنصة الثابتة على كل مشوار مكتمل (بالجنيه). مش نسبة مئوية.
+const double platformFeePerTrip = 5;
 
 /// القائمة الشاملة والنهائية لقرى وعزب مركز أشمون (المنوفية)
 /// تم تجميعها بناءً على الوحدات المحلية لضمان التغطية الجغرافية الكاملة
@@ -73,7 +74,7 @@ final List<Zone> ashmounZones = [
     pricing: Pricing(
       basePrice: 12,
       pricePerKm: 6,
-      minPrice: 20,
+      minPrice: 25,
       maxPrice: 400,
       sameVillagePrice: 15,
       multipliers: {
@@ -99,7 +100,7 @@ final Pricing defaultPricing = ashmounZones.isNotEmpty
     : Pricing(
         basePrice: 12,
         pricePerKm: 6,
-        minPrice: 20,
+        minPrice: 25,
         maxPrice: 400,
         sameVillagePrice: 15,
         multipliers: {
@@ -122,11 +123,31 @@ const List<String> centers = [
   'الشهداء',
 ];
 
-/// إيميلات الأدمن (من App.tsx / Login.tsx)
+/// إيميلات الأدمن (السوبر أدمن بس). admin@ashmoun.com حساب مشغّل (OPERATOR)
+/// ورتبته بتتظبط من إدارة الأعضاء، مش من هنا.
 const List<String> adminEmails = [
-  'admin@ashmoun.com',
-  'mahmoudkhalifa.kh91@gmail.com',
-  'sadat.planning.officer@dakahlia.net',
-  'admin@wasalah.com',
-  'wasalah.app@gmail.com',
+  'superadmin@ashmoun.com',
 ];
+
+/// حسابات مستثناة من تأكيد البريد الإلكتروني ومن إلزام رقم الهاتف.
+/// (لازم تطابق دالة exemptEmails() في firestore.rules)
+const List<String> verificationExemptEmails = [
+  'admin@ashmoun.com',
+  'superadmin@ashmoun.com',
+];
+
+bool isExemptEmail(String? email) =>
+    verificationExemptEmails.contains((email ?? '').trim().toLowerCase());
+
+/// رقم واتساب المطوّر: الحسابات المعطّلة بيرجع لها بس عن طريقه.
+const String developerWhatsApp = '201065019364';
+
+/// رقم افتراضي كان بيتحط تلقائياً للحسابات الجديدة: مش رقم حقيقي.
+const String placeholderPhone = '01000000000';
+
+/// رقم موبايل مصري صحيح (010 / 011 / 012 / 015) وليس الرقم الافتراضي.
+bool isValidPhone(String? phone) {
+  final p = (phone ?? '').trim();
+  if (p == placeholderPhone) return false;
+  return RegExp(r'^(010|011|012|015)[0-9]{8}$').hasMatch(p);
+}

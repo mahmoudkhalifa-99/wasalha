@@ -1,16 +1,19 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../services/geo_service.dart';
 import 'package:intl/intl.dart' as intl;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../config_constants.dart';
 import '../models/models.dart';
+import '../pricing.dart';
 import '../services/firebase_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
 import '../theme/app_text.dart';
 import '../widgets/common.dart';
+import '../widgets/fare_breakdown.dart';
 
 /// نسخة Flutter من pages/ActivityView.tsx
 class ActivityView extends StatefulWidget {
@@ -143,13 +146,16 @@ class _ActivityViewState extends State<ActivityView> {
                   const SizedBox(height: 20),
                   SizedBox(
                     height: 44,
-                    child: ListView(
-                      scrollDirection: Axis.horizontal,
-                      children: [
-                        _filterChip('الكل', 'جميع المراكز'),
-                        for (final d in menofiaData)
-                          _filterChip(d.name, 'مركز ${d.name}'),
-                      ],
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: GeoService.revision,
+                      builder: (_, __, ___) => ListView(
+                        scrollDirection: Axis.horizontal,
+                        children: [
+                          _filterChip('الكل', 'جميع المراكز'),
+                          for (final d in menofiaData)
+                            _filterChip(d.name, 'مركز ${d.name}'),
+                        ],
+                      ),
                     ),
                   ),
                   const SizedBox(height: 20),
@@ -313,6 +319,11 @@ class _ActivityViewState extends State<ActivityView> {
               ],
             ),
           ),
+          if (widget.user.role == UserRole.driver &&
+              order.status == OrderStatus.delivered) ...[
+            const SizedBox(height: 12),
+            FareBreakdownView(fare: tripFareOf(order)),
+          ],
           const SizedBox(height: 12),
           Container(
             padding: const EdgeInsets.only(top: 12),

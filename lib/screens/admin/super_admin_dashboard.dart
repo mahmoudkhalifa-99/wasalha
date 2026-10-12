@@ -6,16 +6,30 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../models/models.dart';
 import '../../services/firebase_service.dart';
+import 'app_status_card.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_shadows.dart';
 import '../../theme/app_text.dart';
 import '../../widgets/common.dart';
 import 'admin_ads_manager.dart';
+import 'broadcast_dialog.dart';
 import 'admin_geography_manager.dart';
 import 'admin_restaurant_manager.dart';
 import 'admin_users_list.dart';
+import '../../features/captain_accounts/ui/captain_accounts_view.dart';
+import '../../features/verification/ui/admin_verification_view.dart';
+import 'reviews_view.dart';
 
-enum _AdminTab { dashboard, users, restaurants, ads, geo }
+enum _AdminTab {
+  dashboard,
+  users,
+  restaurants,
+  ads,
+  geo,
+  reviews,
+  verification,
+  captainAccounts
+}
 
 /// نسخة Flutter من pages/SuperAdminDashboard.tsx
 class SuperAdminDashboard extends StatefulWidget {
@@ -187,6 +201,8 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
                     children: [
                       const SizedBox(height: 12),
                       _topBar(),
+                      const SizedBox(height: 24),
+                      AppStatusCard(userId: widget.user.id),
                       const SizedBox(height: 32),
                       _statsGrid(s),
                       const SizedBox(height: 32),
@@ -232,6 +248,36 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
         return AdminAdsManager(user: widget.user);
       case _AdminTab.geo:
         return AdminGeographyManager(user: widget.user);
+      case _AdminTab.verification:
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 900),
+              child: AdminVerificationView(user: widget.user),
+            ),
+          ),
+        );
+      case _AdminTab.captainAccounts:
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 900),
+              child: CaptainAccountsView(user: widget.user),
+            ),
+          ),
+        );
+      case _AdminTab.reviews:
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 900),
+              child: ReviewsView(user: widget.user),
+            ),
+          ),
+        );
       case _AdminTab.dashboard:
         return const SizedBox.shrink();
     }
@@ -241,30 +287,43 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: C.slate900,
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: Sh.xxl(),
+        Flexible(
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: C.slate900,
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: Sh.xxl(),
+                ),
+                child: const Icon(LucideIcons.shieldCheck,
+                    size: 28, color: Color(0xFF34D399)),
               ),
-              child: const Icon(LucideIcons.shieldCheck,
-                  size: 32, color: Color(0xFF34D399)),
-            ),
-            const SizedBox(width: 16),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Text('مركز الإدارة العليا',
-                    style: T.s(24, T.w900, C.slate900, letterSpacing: -0.6)),
-                Text('التحكم المطلق في المنظومة',
-                    style: T.s(9, T.w700, C.slate400, letterSpacing: 1.2)),
-              ],
-            ),
-          ],
+              const SizedBox(width: 12),
+              Flexible(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text('مركز الإدارة العليا',
+                          style: T.s(22, T.w900, C.slate900,
+                              letterSpacing: -0.6)),
+                    ),
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text('التحكم المطلق في المنظومة',
+                          style: T.s(9, T.w700, C.slate400,
+                              letterSpacing: 1.2)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
+        const SizedBox(width: 8),
         Row(
           children: [
             Container(
@@ -410,12 +469,13 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
   }
 
   Widget _statCard({required Color bg, required Widget content, bool border = false}) {
+    final narrow = MediaQuery.of(context).size.width < 560;
     return Container(
-      height: 200,
-      padding: const EdgeInsets.all(28),
+      height: narrow ? 140 : 200,
+      padding: EdgeInsets.all(narrow ? 20 : 28),
       decoration: BoxDecoration(
         color: bg,
-        borderRadius: BorderRadius.circular(48),
+        borderRadius: BorderRadius.circular(narrow ? 32 : 48),
         border: border ? Border.all(color: C.slate100) : null,
         boxShadow: border ? Sh.sm() : Sh.xxl(),
       ),
@@ -433,6 +493,12 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
           LucideIcons.megaphone, C.amber50, C.amber500),
       (_AdminTab.geo, 'إدارة الجغرافيا', 'إضافة قرى ومراكز جديدة',
           LucideIcons.mapPin, C.rose50, C.rose500),
+      (_AdminTab.verification, 'توثيق الكباتن', 'مراجعة مستندات وهوية الكباتن',
+          LucideIcons.shieldCheck, C.emerald50, C.emerald600),
+      (_AdminTab.captainAccounts, 'حسابات الكباتن', 'عدد المشاوير والنسبة المستحقة لكل كابتن',
+          LucideIcons.bike, C.indigo50, C.indigo500),
+      (_AdminTab.reviews, 'آراء وتقييمات العملاء', 'تقييمات الكباتن وتعليقات العملاء',
+          LucideIcons.star, C.amber50, C.amber500),
     ];
     return LayoutBuilder(builder: (context, box) {
       final cols = box.maxWidth >= 700 ? 2 : 1;
@@ -486,6 +552,52 @@ class _SuperAdminDashboardState extends State<SuperAdminDashboard> {
                 ),
               ),
             ),
+          SizedBox(
+            width: cols == 2 ? (box.maxWidth - 16) / 2 : box.maxWidth,
+            child: PressScale(
+              scale: 0.98,
+              onTap: () => showBroadcastDialog(context, sender: widget.user),
+              child: Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: C.white,
+                  borderRadius: BorderRadius.circular(48),
+                  border: Border.all(color: C.slate100),
+                  boxShadow: Sh.sm(),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Icon(LucideIcons.chevronLeft,
+                        size: 20, color: C.slate200),
+                    Row(
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text('رسالة للمستخدمين',
+                                style: T.s(20, T.w900, C.slate900)),
+                            Text('إرسال لكل المستخدمين أو العملاء أو الكباتن',
+                                style: T.s(10, T.w700, C.slate400)),
+                          ],
+                        ),
+                        const SizedBox(width: 16),
+                        Container(
+                          padding: const EdgeInsets.all(18),
+                          decoration: BoxDecoration(
+                            color: C.indigo50,
+                            borderRadius: BorderRadius.circular(28),
+                          ),
+                          child: const Icon(LucideIcons.send,
+                              size: 28, color: C.indigo500),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ],
       );
     });

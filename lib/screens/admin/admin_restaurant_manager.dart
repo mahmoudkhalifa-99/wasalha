@@ -98,7 +98,7 @@ class _AdminRestaurantManagerState extends State<AdminRestaurantManager> {
       final b64 = base64Encode(bytes);
       final mime =
           file.name.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
-      return utils.compressImage('data:$mime;base64,$b64');
+      return await utils.compressImage('data:$mime;base64,$b64');
     } catch (_) {
       return null;
     }
@@ -707,11 +707,7 @@ class _AdminRestaurantManagerState extends State<AdminRestaurantManager> {
                   borderRadius: BorderRadius.circular(24),
                 ),
                 child: (r.photoURL != null)
-                    ? (r.photoURL!.startsWith('data:image')
-                        ? Image.memory(
-                            base64Decode(r.photoURL!.split(',').last),
-                            fit: BoxFit.cover)
-                        : Image.network(r.photoURL!, fit: BoxFit.cover))
+                    ? SmartImage(r.photoURL, fit: BoxFit.cover)
                     : const Icon(LucideIcons.building2,
                         size: 32, color: Color(0xFF34D399)),
               ),

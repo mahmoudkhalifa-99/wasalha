@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
+import '../core/map/map_config.dart';
 import '../theme/app_colors.dart';
 
 /// نسخة Flutter من إعداد خريطة Leaflet المستخدم في نسخة الويب:
-/// نفس التايل سيرفر (CartoDB light_all) بنفس الأسلوب.
+/// التايلز من MapConfig (مكان واحد للتغيير).
 class WasalhaMap extends StatefulWidget {
   final ll.LatLng center;
   final double zoom;
@@ -13,6 +14,10 @@ class WasalhaMap extends StatefulWidget {
   final List<ll.LatLng> routeGeometry; // [lat, lng] نفس الأصل
   final List<ll.LatLng>? fitPoints; // مكافئ MapAutoFit
   final bool showControls;
+
+  /// true: الكاميرا بتتبع [center] (موقع الكابتن) لما مفيش fitPoints،
+  /// طالما المستخدم مش بيحرّك الخريطة بإيده.
+  final bool followCenter;
   const WasalhaMap({
     super.key,
     required this.center,
@@ -20,7 +25,8 @@ class WasalhaMap extends StatefulWidget {
     this.markers = const [],
     this.routeGeometry = const [],
     this.fitPoints,
-    this.showControls = true,
+    this.showControls = false, // أزرار التكبير: اختيارية ومقفولة افتراضياً
+    this.followCenter = false,
   });
 
   @override
@@ -30,7 +36,10 @@ class WasalhaMap extends StatefulWidget {
 class _WasalhaMapState extends State<WasalhaMap> {
   final MapController _controller = MapController();
   bool _ready = false;
+  bool _userMoved = false;
   String? _fitKey;
+  int _tileErrors = 0;
+  bool _useFallbackTiles = false;
 
   // مفتاح الوجهة: بنعيد ضبط الكاميرا بس لما الوجهة تتغير، مش مع كل تحديث
   // لموقع الكابتن — عشان المستخدم يقدر يحرّك الخريطة بحرية.
@@ -48,6 +57,16 @@ class _WasalhaMapState extends State<WasalhaMap> {
     super.didUpdateWidget(old);
     final k = _keyFor(widget.fitPoints);
     if (_ready && k != null && k != _fitKey) _fit();
+    if (_ready &&
+        widget.followCenter &&
+        !_userMoved &&
+        (widget.fitPoints == null || widget.fitPoints!.length < 2) &&
+        (old.center.latitude != widget.center.latitude ||
+            old.center.longitude != widget.center.longitude)) {
+      try {
+        _controller.move(widget.center, _controller.camera.zoom);
+      } catch (_) {}
+    }
   }
 
   void _fit() {
@@ -58,14 +77,17 @@ class _WasalhaMapState extends State<WasalhaMap> {
       _controller.fitCamera(
         CameraFit.bounds(
           bounds: LatLngBounds.fromPoints(pts),
-          padding: const EdgeInsets.fromLTRB(56, 96, 56, 56),
+          padding: const EdgeInsets.all(50),
           maxZoom: 17,
         ),
       );
-    } catch (_) {}
+    } catch (_) {
+      // الخريطة لسه مش جاهزة (fitCamera قبل أول رسم)، هنعيد المحاولة مع التحديث الجاي
+    }
   }
 
   void _recenter() {
+    _userMoved = false;
     final pts = widget.fitPoints;
     if (pts != null && pts.length >= 2) {
       _fit();
@@ -98,10 +120,12 @@ class _WasalhaMapState extends State<WasalhaMap> {
   @override
   Widget build(BuildContext context) {
     return Stack(
+      fit: StackFit.expand,
       children: [
         FlutterMap(
           mapController: _controller,
           options: MapOptions(
+            backgroundColor: const Color(0xFFE9EEF1),
             initialCenter: widget.center,
             initialZoom: widget.zoom,
             minZoom: 5,
@@ -110,25 +134,43 @@ class _WasalhaMapState extends State<WasalhaMap> {
               _ready = true;
               _fit();
             },
+            onPositionChanged: (cam, hasGesture) {
+              if (hasGesture) _userMoved = true;
+            },
             interactionOptions: const InteractionOptions(
               flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
             ),
           ),
           children: [
             TileLayer(
-              urlTemplate:
-                  'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-              subdomains: const ['a', 'b', 'c', 'd'],
-              retinaMode: RetinaMode.isHighDensity(context),
+              key: ValueKey(_useFallbackTiles),
+              urlTemplate: _useFallbackTiles
+                  ? MapConfig.fallbackTileUrlTemplate
+                  : MapConfig.tileUrlTemplate,
+              subdomains:
+                  _useFallbackTiles ? const ['a'] : MapConfig.tileSubdomains,
+              retinaMode: MapConfig.retinaFor(context),
               maxNativeZoom: 19,
-              userAgentPackageName: 'com.wasalah.app',
+              userAgentPackageName: MapConfig.userAgentPackageName,
+              evictErrorTileStrategy: EvictErrorTileStrategy.notVisible,
+              // لو التايلز الأساسية فشلت كذا مرة ورا بعض: نحوّل للاحتياطية.
+              errorTileCallback: (tile, error, stack) {
+                if (_useFallbackTiles) return;
+                if (++_tileErrors >= 6) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted && !_useFallbackTiles) {
+                      setState(() => _useFallbackTiles = true);
+                    }
+                  });
+                }
+              },
             ),
             if (widget.routeGeometry.length > 1)
               PolylineLayer(polylines: [
                 Polyline(
                   points: widget.routeGeometry,
-                  color: C.emerald600,
-                  strokeWidth: 5,
+                  color: C.emerald600.withOpacity(0.9),
+                  strokeWidth: 6,
                   borderColor: C.white,
                   borderStrokeWidth: 2,
                 ),
@@ -138,7 +180,7 @@ class _WasalhaMapState extends State<WasalhaMap> {
               alignment: AttributionAlignment.bottomRight,
               showFlutterMapAttribution: false,
               attributions: [
-                TextSourceAttribution('© OpenStreetMap contributors © CARTO'),
+                TextSourceAttribution(MapConfig.attribution),
               ],
             ),
           ],
@@ -171,6 +213,7 @@ Marker driverMarker(ll.LatLng point) {
     height: 48,
     child: Stack(
       alignment: Alignment.center,
+      clipBehavior: Clip.none,
       children: [
         Container(
           width: 48,

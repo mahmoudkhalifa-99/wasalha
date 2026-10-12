@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 import 'package:file_selector/file_selector.dart';
@@ -10,21 +9,31 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../config_constants.dart';
+import '../pricing.dart';
+import '../core/map/geo_utils.dart' as geo;
+import '../features/tracking/models/tracking_models.dart' show GeoFix;
+import '../features/tracking/services/captain_locations.dart';
+import '../features/tracking/services/driver_location_source.dart' show driverLocationsCollection;
 import '../models/models.dart';
+import '../services/back_interceptor.dart';
 import '../services/firebase_service.dart';
 import '../services/notification_service.dart';
 import '../services/order_service.dart' as order_service;
+import '../models/review.dart';
+import '../services/review_service.dart';
+import '../services/storage_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_shadows.dart';
 import '../theme/app_text.dart';
 import '../utils.dart' as utils;
+import '../widgets/captains_offers_map.dart';
 import '../widgets/common.dart';
 import '../widgets/leaflet_map.dart';
+import '../widgets/map_location_picker.dart';
 import 'activity_view.dart';
 import 'profile_view.dart';
 import 'wallet_view.dart';
 import 'chat_view.dart';
-import 'ai_assistant.dart';
 
 /// نسخة Flutter من pages/CustomerDashboard.tsx — نفس المنطق والتصميم بالظبط.
 class CustomerDashboard extends StatefulWidget {
@@ -48,6 +57,12 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   District? _dropoffDistrict;
   Village? _dropoffVillage;
   final _dropoffNoteCtrl = TextEditingController();
+  // نقطة دقيقة اختارها العميل (موقعي الحالي / من الخريطة). null = مركز القرية.
+  PickedPlace? _dropoffPoint;
+  PickedPlace? _pickupPoint;
+
+  bool get _hasPickup => _pickupVillage != null || _pickupPoint != null;
+  bool get _hasDropoff => _dropoffVillage != null || _dropoffPoint != null;
 
   List<Restaurant> _restaurants = [];
   List<Ad> _ads = [];
@@ -62,11 +77,12 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   VehicleType _selectedVehicle = VehicleType.motorcycle;
   Order? _activeOrder;
   List<Offer> _incomingOffers = [];
+  final CaptainLocations _captainLocs = CaptainLocations();
+  bool _offersByDistance = false; // ترتيب العروض: false = الأرخص، true = الأقرب
 
   double _actualRoadDist = 0;
   bool _isCalculatingDist = false;
 
-  bool _aiOpen = false;
   bool _showChat = false;
   bool _isSubmitting = false;
   String? _acceptingOfferId;
@@ -78,14 +94,39 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   // Tracking
   ll.LatLng? _driverLoc;
   List<ll.LatLng> _routeGeometry = [];
+  // مسار الكابتن: طلب واحد في نفس الوقت + تباعد تصاعدي بعد الفشل/429.
+  final utils.RouteBackoff _routeBackoff = utils.RouteBackoff();
+  bool _routeInFlight = false;
+  Timer? _routeRetryTimer;
 
   StreamSubscription? _subRestaurants, _subAds, _subOrders, _subOffers, _subDriver;
 
   AppUser get user => widget.user;
 
+  bool _onBack() {
+    if (_showChat) {
+      setState(() => _showChat = false);
+      return true;
+    }
+    if (_viewingRestaurant != null) {
+      setState(() => _viewingRestaurant = null);
+      return true;
+    }
+    if (_showManualRest) {
+      setState(() => _showManualRest = false);
+      return true;
+    }
+    if (_activeView != _DashView.newOrder) {
+      setState(() => _activeView = _DashView.newOrder);
+      return true;
+    }
+    return false;
+  }
+
   @override
   void initState() {
     super.initState();
+    BackInterceptor.register(_onBack);
 
     _subRestaurants = db
         .collection('restaurants')
@@ -134,6 +175,23 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
           break;
         }
       }
+      // طلب اتسلّم واستلامه متأكد ولسه متقيّمش ولا اتخطى: نفضل نعرض شاشة التقييم
+      // (آخر واحد بس، وخلال 7 أيام عشان طلبات قديمة ما ترجعش).
+      if (active == null) {
+        final cutoff = DateTime.now()
+            .subtract(const Duration(days: 7))
+            .millisecondsSinceEpoch;
+        for (final o in all) {
+          if (o.status == OrderStatus.delivered &&
+              needsReview(o) &&
+              (o.deliveredAt ?? o.updatedAt) >= cutoff &&
+              (active == null ||
+                  (o.deliveredAt ?? o.updatedAt) >
+                      (active.deliveredAt ?? active.updatedAt))) {
+            active = o;
+          }
+        }
+      }
       final prevId = _activeOrder?.id;
       final prevStatus = _activeOrder?.status;
       final prevDriver = _activeOrder?.driverId;
@@ -150,11 +208,14 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
 
   @override
   void dispose() {
+    BackInterceptor.unregister(_onBack);
     _subRestaurants?.cancel();
     _subAds?.cancel();
     _subOrders?.cancel();
     _subOffers?.cancel();
     _subDriver?.cancel();
+    _routeRetryTimer?.cancel();
+    _captainLocs.dispose();
     _pickupNoteCtrl.dispose();
     _dropoffNoteCtrl.dispose();
     _pharmacyNoteCtrl.dispose();
@@ -166,6 +227,11 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   void _onActiveOrderChanged() {
     _subOffers?.cancel();
     _subDriver?.cancel();
+    // الوجهة اتغيّرت (مرحلة جديدة/كابتن جديد): المسار والتباعد القديمين ملغيين.
+    _routeRetryTimer?.cancel();
+    _routeBackoff.reset();
+    _lastRouteAt = null;
+    _routeGeometry = [];
 
     final order = _activeOrder;
     if (order != null && order.status == OrderStatus.pending) {
@@ -181,36 +247,40 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                   stripFirestore(d.data()) as Map<String, dynamic>, d.id))
               .toList();
         });
+        // نتابع مواقع الكباتن اللي قدّموا عروض (عشان العميل يختار الأقرب).
+        _captainLocs.sync(_incomingOffers.map((o) => o.driverId));
       }, onError: (e) =>
           handleFirestoreError(e, OperationType.list, 'offers (order: ${order.id})'));
+    } else {
+      _captainLocs.sync(const []);
     }
 
     if (order != null &&
         order.driverId != null &&
         order.status != OrderStatus.pending) {
+      // موقع الكابتن في driver_locations (القواعد: مقروء للعميل بس لو الكابتن
+      // ضافه في viewers، يعني قدّم عرض على طلبه أو اتعيّن عليه).
       _subDriver = db
-          .collection('users')
+          .collection(driverLocationsCollection)
           .doc(order.driverId)
           .snapshots()
-          .listen((docSnap) async {
+          .listen((docSnap) {
         if (!mounted || !docSnap.exists) return;
         final data = docSnap.data();
-        final loc = data?['location'];
-        if (loc is Map) {
-          final lat = (loc['lat'] as num).toDouble();
-          final lng = (loc['lng'] as num).toDouble();
-          setState(() => _driverLoc = ll.LatLng(lat, lng));
-          final dest = order.status == OrderStatus.assigned
-              ? order.pickup
-              : order.dropoff;
-          final geo = await utils.getRouteGeometry(lat, lng, dest.lat, dest.lng);
-          if (mounted) {
-            setState(() => _routeGeometry =
-                geo.map((p) => ll.LatLng(p[0], p[1])).toList());
-          }
-        }
-      }, onError: (e) => handleFirestoreError(
-          e, OperationType.get, 'users/${order.driverId}'));
+        final latV = data?['lat'];
+        final lngV = data?['lng'];
+        if (latV is! num || lngV is! num) return;
+        final lat = latV.toDouble();
+        final lng = lngV.toDouble();
+        final moved = _driverLoc == null ||
+            (_driverLoc!.latitude - lat).abs() > 0.00005 ||
+            (_driverLoc!.longitude - lng).abs() > 0.00005;
+        if (!moved) return; // نفس المكان: مفيش داعي لإعادة البناء
+        setState(() => _driverLoc = ll.LatLng(lat, lng));
+        _refreshDriverRoute();
+      }, onError: (e) => debugPrint('driver location unavailable: $e'));
+      // لو موقع الكابتن معروف من قبل، نحسب مسار الوجهة الجديدة فورًا.
+      if (_driverLoc != null) _refreshDriverRoute(force: true);
     } else {
       setState(() {
         _driverLoc = null;
@@ -219,47 +289,170 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     }
   }
 
+  /// نقطة الاستلام الحقيقية (null للصيدلية/الطلب اليدوي) أو مكان العميل.
+  ll.LatLng? _trackingDestination(Order order) =>
+      order.status == OrderStatus.assigned
+          ? orderPickupPoint(order)
+          : orderDropoffPoint(order);
+
+  /// مسار الكابتن للوجهة: كل 15 ثانية بحد أقصى، وبعد الفشل/429 بتباعد تصاعدي.
+  Future<void> _refreshDriverRoute({bool force = false}) async {
+    final order = _activeOrder;
+    final from = _driverLoc;
+    final dest = order == null ? null : _trackingDestination(order);
+    if (order == null || from == null || dest == null) {
+      _routeRetryTimer?.cancel();
+      _routeBackoff.reset();
+      if (mounted && _routeGeometry.isNotEmpty) {
+        setState(() => _routeGeometry = []);
+      }
+      return;
+    }
+    if (_routeInFlight || _routeBackoff.blocked) return;
+    final now = DateTime.now();
+    if (!force &&
+        _lastRouteAt != null &&
+        now.difference(_lastRouteAt!) < const Duration(seconds: 15) &&
+        _routeGeometry.isNotEmpty) {
+      return;
+    }
+    _lastRouteAt = now;
+    _routeInFlight = true;
+    final info = utils.RouteFetchInfo();
+    final key = '${order.id}|${order.status.value}';
+    var stale = false;
+    try {
+      final geo = await utils.getRouteGeometry(
+          from.latitude, from.longitude, dest.latitude, dest.longitude,
+          info: info);
+      if (!mounted) return;
+      final cur = _activeOrder;
+      if (cur == null || '${cur.id}|${cur.status.value}' != key) {
+        stale = true; // الطلب/المرحلة اتغيّرت أثناء الانتظار
+      } else if (utils.isStraightFallback(geo)) {
+        // فشل السيرفر: منستبدلش طريق حقيقي قديم بخط مستقيم، وبنعيد المحاولة
+        // بتباعد تصاعدي (مش مع كل تحديث لموقع الكابتن).
+        _onRouteFailure(rateLimited: info.rateLimited);
+        if (_routeGeometry.length <= 2) {
+          setState(() => _routeGeometry =
+              geo.map((p) => ll.LatLng(p[0], p[1])).toList());
+        }
+      } else {
+        _routeBackoff.succeed();
+        _routeRetryTimer?.cancel();
+        setState(() =>
+            _routeGeometry = geo.map((p) => ll.LatLng(p[0], p[1])).toList());
+      }
+    } catch (_) {
+      if (mounted) _onRouteFailure();
+    } finally {
+      _routeInFlight = false;
+    }
+    if (stale && mounted) _refreshDriverRoute(force: true);
+  }
+
+  void _onRouteFailure({bool rateLimited = false}) {
+    final wait = _routeBackoff.fail(rateLimited: rateLimited);
+    _routeRetryTimer?.cancel();
+    _routeRetryTimer = Timer(wait, () {
+      if (mounted) _refreshDriverRoute(force: true);
+    });
+  }
+
+  int _distReq = 0; // رقم آخر طلب مسافة: الردود القديمة بتتجاهل
+
   Future<void> _recalcDistance() async {
+    final req = ++_distReq;
+    if (!_hasPickup || !_hasDropoff) {
+      // مفيش مسار كامل: ما نسيبش مسافة قديمة تتحسب في السعر
+      setState(() {
+        _actualRoadDist = 0;
+        _isCalculatingDist = false;
+      });
+      return;
+    }
     final p = _pickupVillage, d = _dropoffVillage;
-    if (p == null || d == null) return;
-    if (p.id == d.id) {
-      setState(() => _actualRoadDist = 0);
+    if (p != null &&
+        d != null &&
+        p.id == d.id &&
+        _pickupPoint == null &&
+        _dropoffPoint == null) {
+      setState(() {
+        _actualRoadDist = 0;
+        _isCalculatingDist = false;
+      });
       return;
     }
     setState(() => _isCalculatingDist = true);
     try {
-      final res = await utils.getRoadDistance(
-          p.center.lat, p.center.lng, d.center.lat, d.center.lng);
-      if (!mounted) return;
+      final pLat = _pickupPoint?.latitude ?? p?.center.lat;
+      final pLng = _pickupPoint?.longitude ?? p?.center.lng;
+      final dLat = _dropoffPoint?.latitude ?? d?.center.lat;
+      final dLng = _dropoffPoint?.longitude ?? d?.center.lng;
+      if (pLat == null || pLng == null || dLat == null || dLng == null) {
+        if (mounted && req == _distReq) {
+          setState(() {
+            _actualRoadDist = 0;
+            _isCalculatingDist = false;
+          });
+        }
+        return;
+      }
+      final res = await utils.getRoadDistance(pLat, pLng, dLat, dLng);
+      if (!mounted || req != _distReq) return; // اتغيّرت الاختيارات أثناء الحساب
       setState(() {
         _actualRoadDist = res.distance;
         _isCalculatingDist = false;
       });
     } catch (_) {
-      if (mounted) setState(() => _isCalculatingDist = false);
+      if (mounted && req == _distReq) setState(() => _isCalculatingDist = false);
     }
   }
 
   void _onPickupVillageChanged(Village v) {
-    setState(() => _pickupVillage = v);
+    setState(() {
+      _pickupVillage = v;
+      _pickupPoint = null; // اختار قرية يدويًا: نرجع لمركز القرية
+    });
     _recalcDistance();
   }
 
   void _onDropoffVillageChanged(Village v) {
-    setState(() => _dropoffVillage = v);
+    setState(() {
+      _dropoffVillage = v;
+      _dropoffPoint = null;
+    });
+    _recalcDistance();
+  }
+
+  /// مكان اتحدد بالخريطة/الـ GPS: بنحفظه باسمه الفعلي. لو اسمه مطابق تمامًا
+  /// لقرية في القائمة بنختارها، غير كده القرية بتتفضى والاسم الحقيقي
+  /// (مثلاً "طملاي") هو اللي بيتعرض ويتخزّن في الطلب.
+  void _onDropoffPicked(PickedPlace pl) {
+    setState(() {
+      _dropoffPoint = pl;
+      _dropoffDistrict = pl.knownMatch?.district;
+      _dropoffVillage = pl.knownMatch?.village;
+    });
+    _recalcDistance();
+  }
+
+  void _onPickupPicked(PickedPlace pl) {
+    setState(() {
+      _pickupPoint = pl;
+      _pickupDistrict = pl.knownMatch?.district;
+      _pickupVillage = pl.knownMatch?.village;
+    });
     _recalcDistance();
   }
 
   double get _estimatedPrice {
+    if (!_hasPickup || !_hasDropoff) return 0;
     final p = _pickupVillage, d = _dropoffVillage;
-    if (p == null || d == null) return 0;
-    if (p.id == d.id) return configDefaultPricing.sameVillagePrice;
-    final baseFare =
-        configDefaultPricing.basePrice + (_actualRoadDist * configDefaultPricing.pricePerKm);
-    final multiplier = configDefaultPricing.multipliers[_selectedVehicle] ?? 1.0;
-    final v = baseFare * multiplier;
-    return (v < configDefaultPricing.minPrice ? configDefaultPricing.minPrice : v)
-        .roundToDouble();
+    if (p != null && d != null && p.id == d.id) {
+      return finalFare(configDefaultPricing.sameVillagePrice);
+    }
+    return calculateTripFare(_actualRoadDist, _selectedVehicle);
   }
 
   Future<void> _handleAcceptOffer(Offer offer) async {
@@ -274,12 +467,12 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         'driverPhone': offer.driverPhone,
         'driverPhoto': offer.driverPhoto,
         'acceptedAt': DateTime.now().millisecondsSinceEpoch,
-        'price': offer.price,
+        'price': finalFare(offer.price),
       });
       await NotificationService.notifyUser(
         userId: offer.driverId,
         title: 'تم قبول عرضك ✅',
-        body: '${user.name} وافق على عرضك ${offer.price.toInt()} ج.م — ابدأ المشوار',
+        body: '${user.name} وافق على عرضك ${finalFare(offer.price).toInt()} ج.م — ابدأ المشوار',
         type: 'SUCCESS',
         key: 'accepted_${order.id}',
         orderId: order.id,
@@ -299,23 +492,65 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     String? restaurantName,
     List<CartItem>? foodItems,
     String? prescriptionImage,
+    PickedPlace? deliveryPoint,
   }) async {
+    // من شاشة المطعم بيجي deliveryVillage أو deliveryPoint (مكان فعلي من
+    // الخريطة/الـ GPS)؛ غير كده بنستخدم اللي اختاره العميل في الشاشة الرئيسية.
+    final dp = deliveryPoint ?? (deliveryVillage == null ? _dropoffPoint : null);
     final finalVillage = deliveryVillage ?? _dropoffVillage;
-    if (finalVillage == null) {
+    if (finalVillage == null && dp == null) {
       showAppAlert(context, 'يرجى تحديد مكان التوصيل');
       return;
     }
     setState(() => _isSubmitting = true);
     try {
+      // صورة الروشتة: نرفعها على Storage ونحفظ الرابط بدل base64 جوه الطلب
+      // (حد وثيقة Firestore 1 ميجا). لو الرفع فشل نحتفظ بها داخل الطلب بس لو صغيرة.
+      var rx = prescriptionImage;
+      if (rx != null && rx.startsWith('data:')) {
+        final inline = rx;
+        try {
+          rx = await StorageService.uploadPrescription(
+              uid: user.id, dataUrl: inline);
+        } catch (e) {
+          debugPrint('prescription upload failed: $e');
+          if (inline.length > StorageService.maxInlineChars) {
+            if (mounted) {
+              showAppAlert(context,
+                  'تعذر رفع صورة الروشتة. اتأكد من الاتصال وحاول تاني.');
+            }
+            return;
+          }
+        }
+      }
+
       final orderPrice = price ?? _estimatedPrice;
+      final pp = _pickupPoint;
       final orderPickup = (_selectedCategory == OrderCategory.taxi &&
-              _pickupVillage != null)
-          ? OrderPlace(
-              address: _pickupVillage!.name,
-              lat: _pickupVillage!.center.lat,
-              lng: _pickupVillage!.center.lng,
-              villageName: _pickupVillage!.name)
+              (pp != null || _pickupVillage != null))
+          ? (pp != null
+              ? OrderPlace(
+                  address: pp.displayText,
+                  lat: pp.latitude,
+                  lng: pp.longitude,
+                  villageName: pp.placeName)
+              : OrderPlace(
+                  address: _pickupVillage!.name,
+                  lat: _pickupVillage!.center.lat,
+                  lng: _pickupVillage!.center.lng,
+                  villageName: _pickupVillage!.name))
           : pickup;
+      final dropPlace = dp != null
+          ? OrderPlace(
+              address: dp.displayText,
+              lat: dp.latitude,
+              lng: dp.longitude,
+              villageName: dp.placeName)
+          : OrderPlace(
+              address: finalVillage!.name,
+              lat: finalVillage.center.lat,
+              lng: finalVillage.center.lng,
+              villageName: finalVillage.name);
 
       final orderData = <String, dynamic>{
         'customerId': user.id,
@@ -323,12 +558,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         'category': _selectedCategory.value,
         'paymentMethod': PaymentMethod.cash.value,
         'pickup': orderPickup?.toMap(),
-        'dropoff': OrderPlace(
-                address: finalVillage.name,
-                lat: finalVillage.center.lat,
-                lng: finalVillage.center.lng,
-                villageName: finalVillage.name)
-            .toMap(),
+        'dropoff': dropPlace.toMap(),
         'requestedVehicleType': _selectedVehicle.value,
         'price': orderPrice,
         'distance': distance ?? _actualRoadDist,
@@ -339,7 +569,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         if (restaurantName != null) 'restaurantName': restaurantName,
         if (foodItems != null)
           'foodItems': foodItems.map((e) => e.toMap()).toList(),
-        if (prescriptionImage != null) 'prescriptionImage': prescriptionImage,
+        if (rx != null) 'prescriptionImage': rx,
       };
 
       final newOrderId = await order_service.createOrder(orderData);
@@ -347,45 +577,12 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         userId: UserRole.driver.value,
         title: 'طلب جديد 🛵',
         body:
-            '${orderPickup?.villageName ?? "مشوار"} ← ${finalVillage.name} • ${orderPrice.toInt()} ج.م',
+            '${orderPickup?.villageName ?? "مشوار"} ← ${dropPlace.villageName} • ${orderPrice.toInt()} ج.م',
         type: 'ALERT',
         key: 'order_$newOrderId',
         orderId: newOrderId,
       );
 
-      // بناء رسالة واتساب تفصيلية وشاملة (نفس نص نسخة الويب بالظبط)
-      final catLabel = _selectedCategory == OrderCategory.taxi
-          ? '🚖 مشوار'
-          : _selectedCategory == OrderCategory.food
-              ? '🍔 طلب أكل'
-              : '💊 صيدلية';
-      final vehicleLabel = _selectedVehicle == VehicleType.toktok
-          ? 'توكتوك 🛺'
-          : _selectedVehicle == VehicleType.motorcycle
-              ? 'موتوسيكل 🏍️'
-              : 'سيارة 🚗';
-
-      var foodSummary = '';
-      if (foodItems != null && foodItems.isNotEmpty) {
-        foodSummary = '\n📋 *الأصناف المطلوبة:*\n' +
-            foodItems.map((i) => '- ${i.name} (عدد: ${i.quantity})').join('\n');
-      }
-
-      final whatsappMsg = '*📢 طلب جديد من تطبيق وصلها*\n\n'
-          '👤 *العميل:* ${user.name}\n'
-          '📱 *الهاتف:* ${user.phone}\n'
-          '📂 *القسم:* $catLabel\n'
-          '📍 *الانطلاق:* ${orderPickup?.villageName ?? "غير محدد"}\n'
-          '🏁 *التوصيل:* ${finalVillage.name}\n'
-          '🛵 *المركبة:* $vehicleLabel\n'
-          '💰 *التكلفة:* $orderPrice ج.م\n'
-          '${specialRequest != null ? "📝 *ملاحظة:* $specialRequest\n" : ""}'
-          '$foodSummary'
-          '\n\n_تم الإرسال من تطبيق وصلها المنوفية_';
-
-      final url = Uri.parse(
-          'https://wa.me/201065019364?text=${Uri.encodeComponent(whatsappMsg)}');
-      await launchUrl(url, mode: LaunchMode.externalApplication);
     } catch (e) {
       if (mounted) showAppAlert(context, 'خطأ في إرسال الطلب');
     } finally {
@@ -412,25 +609,98 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     }
   }
 
-  Future<void> _handleRateTrip() async {
-    final order = _activeOrder;
-    if (order == null) return;
+  Future<void> _handleRateTrip(Order order) async {
+    if (_isRatingSubmitting || order.driverId == null) return;
     setState(() => _isRatingSubmitting = true);
     try {
-      await db.collection('orders').doc(order.id).update({
-        'rating': _rating,
-        'feedback': _feedbackCtrl.text.trim(),
-        'ratedAt': DateTime.now().millisecondsSinceEpoch,
-      });
+      await ReviewService.submit(
+        order: order,
+        customerName: user.name,
+        rating: _rating,
+        comment: _feedbackCtrl.text,
+      );
+      if (!mounted) return;
       setState(() {
         _rating = 5;
         _feedbackCtrl.clear();
       });
     } catch (e) {
-      if (mounted) showAppAlert(context, 'خطأ في التقييم');
+      if (mounted) showAppAlert(context, 'تعذر إرسال التقييم: ${friendlyError(e)}');
     } finally {
       if (mounted) setState(() => _isRatingSubmitting = false);
     }
+  }
+
+  Future<void> _handleSkipRating(Order order) async {
+    try {
+      await ReviewService.skip(order);
+    } catch (e) {
+      if (mounted) showAppAlert(context, 'تعذر التخطي: ${friendlyError(e)}');
+    }
+  }
+
+  /// نجوم + تعليق + زرار إرسال. بيتعرض بعد تأكيد الاستلام وفي شاشة "وصلت بالسلامة".
+  Widget _ratingForm(Order order, {bool compact = false}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            for (var st = 1; st <= 5; st++)
+              GestureDetector(
+                onTap: () => setState(() => _rating = st),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Icon(LucideIcons.star,
+                      size: compact ? 36 : 48,
+                      color: _rating >= st ? C.amber400 : C.slate200),
+                ),
+              ),
+          ],
+        ),
+        SizedBox(height: compact ? 14 : 28),
+        Container(
+          decoration: BoxDecoration(
+            color: C.white,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: C.slate100, width: 2),
+          ),
+          child: TextField(
+            controller: _feedbackCtrl,
+            maxLines: null,
+            minLines: compact ? 3 : 4,
+            maxLength: maxReviewCommentLength,
+            textAlign: TextAlign.right,
+            textDirection: TextDirection.rtl,
+            style: T.s(13, T.w700, C.slate800),
+            decoration: InputDecoration(
+              border: InputBorder.none,
+              hintText: 'اكتب تعليقك على الكابتن (اختياري)',
+              hintStyle: T.s(13, T.w700, C.gray400),
+              contentPadding: const EdgeInsets.all(18),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        PressScale(
+          onTap: _isRatingSubmitting ? null : () => _handleRateTrip(order),
+          child: Container(
+            padding: EdgeInsets.symmetric(vertical: compact ? 16 : 24),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: C.emerald600,
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: Sh.lg(),
+            ),
+            child: _isRatingSubmitting
+                ? const Spinner()
+                : Text('إرسال التقييم',
+                    style: T.s(compact ? 15 : 20, T.w900, C.white)),
+          ),
+        ),
+      ],
+    );
   }
 
   // ───────────────────────── الواجهة ─────────────────────────
@@ -490,9 +760,15 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
           ),
         ),
         _bottomNav(),
-        if (_aiOpen) AIAssistant(isOpen: _aiOpen, onClose: () => setState(() => _aiOpen = false)),
         if (_viewingAd != null)
-          AdDetailsView(ad: _viewingAd!, onClose: () => setState(() => _viewingAd = null)),
+          AdDetailsView(
+            ad: _viewingAd!,
+            onClose: () => setState(() => _viewingAd = null),
+            onOrderNow: _viewingAd!.type == 'restaurant' &&
+                    (_viewingAd!.targetId ?? '').isNotEmpty
+                ? () => _openRestaurantFromAd(_viewingAd!)
+                : null,
+          ),
         if (_showManualRest)
           ManualRestaurantView(
             onClose: () => setState(() => _showManualRest = false),
@@ -501,9 +777,11 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                 restaurantName: data.name,
                 specialRequest: data.items,
                 deliveryVillage: data.village,
+                deliveryPoint: data.point,
                 price: 35, // سعر مبدأي تقديري (نفس نسخة الويب)
+                // مطعم يدوي: مكانه مش معروف. الإحداثيات 0 = "غير موجودة" (مش نقطة وهمية).
                 pickup: const OrderPlace(
-                    address: '', lat: 30.2931, lng: 30.9863, villageName: 'خارجي'),
+                    address: '', lat: 0, lng: 0, villageName: 'خارجي'),
               );
               setState(() => _showManualRest = false);
             },
@@ -513,9 +791,10 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
             restaurant: _viewingRestaurant!,
             initialDropoffVillage: _dropoffVillage,
             initialDistrict: _dropoffDistrict,
+            initialDropoffPoint: _dropoffPoint,
             onClose: () => setState(() => _viewingRestaurant = null),
             onConfirmOrder: (cart, foodTotal, deliveryTotal, grandTotal, distance,
-                village, specialRequest) {
+                village, point, specialRequest) {
               _handleCreateOrder(
                 restaurantId: _viewingRestaurant!.id,
                 restaurantName: _viewingRestaurant!.name,
@@ -524,6 +803,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                 price: grandTotal,
                 distance: distance,
                 deliveryVillage: village,
+                deliveryPoint: point,
                 pickup: OrderPlace(
                     address: _viewingRestaurant!.name,
                     lat: _viewingRestaurant!.lat,
@@ -537,6 +817,31 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     );
   }
 
+  /// زر "اطلب الآن" في إعلان مربوط بمطعم: يقفل الإعلان ويفتح صفحة المطعم.
+  Future<void> _openRestaurantFromAd(Ad ad) async {
+    // عدّاد النقرات best-effort: لو فشل ما يمنعش فتح المطعم.
+    unawaited(db
+        .collection('ads')
+        .doc(ad.id)
+        .update({'clicks': FieldValue.increment(1)}).catchError((_) {}));
+    Restaurant? rest;
+    for (final r in _restaurants) {
+      if (r.id == ad.targetId) {
+        rest = r;
+        break;
+      }
+    }
+    if (rest == null) {
+      await showAppAlert(context, 'المطعم ده مش متاح حالياً');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _viewingAd = null;
+      _viewingRestaurant = rest;
+    });
+  }
+
   // ── الحالة الافتراضية: طلب جديد ──
 
   List<Widget> _newOrderChildren(BuildContext context) {
@@ -545,38 +850,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          PressScale(
-            scale: 0.95,
-            onTap: () => setState(() => _aiOpen = true),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(colors: [
-                  C.emerald50.withOpacity(0.9),
-                  const Color(0xFFF0FDFA), // teal-50
-                ]),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: C.emerald200.withOpacity(0.6)),
-                boxShadow: Sh.sm(),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(6),
-                    decoration: BoxDecoration(
-                      color: C.emerald600,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(LucideIcons.bot, size: 16, color: C.white),
-                  ),
-                  const SizedBox(width: 8),
-                  Text('المساعد الذكي',
-                      style: T.s(12, T.w700, C.emerald800)),
-                ],
-              ),
-            ),
-          ),
+          const SizedBox.shrink(),
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
@@ -800,22 +1074,30 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         selectedDistrict: _dropoffDistrict,
         selectedVillage: _dropoffVillage,
         onSelectDistrict: (d) => setState(() => _dropoffDistrict = d),
-        onSelectVillage: (v) => setState(() => _dropoffVillage = v),
+        onSelectVillage: (v) => setState(() {
+          _dropoffVillage = v;
+          _dropoffPoint = null;
+        }),
         addressNoteCtrl: _dropoffNoteCtrl,
+        pickedAddress: _dropoffPoint?.displayText,
+        customPlaceName: _dropoffPoint?.placeName,
+        customArea: _dropoffPoint?.area,
+        onPickedOnMap: _onDropoffPicked,
       ),
       const SizedBox(height: 24),
       PressScale(
         onTap: (_isSubmitting ||
                 (_pharmacyNoteCtrl.text.isEmpty && _prescriptionImage == null) ||
-                _dropoffVillage == null)
+                !_hasDropoff)
             ? null
             : () => _handleCreateOrder(
                 specialRequest: _pharmacyNoteCtrl.text,
                 prescriptionImage: _prescriptionImage,
+                // الصيدلية مكانها مش معروف. الإحداثيات 0 = "غير موجودة" (مش نقطة وهمية).
                 pickup: const OrderPlace(
                     address: 'صيدلية',
-                    lat: 30.2931,
-                    lng: 30.9863,
+                    lat: 0,
+                    lng: 0,
                     villageName: 'أقرب صيدلية')),
         child: Container(
           width: double.infinity,
@@ -957,7 +1239,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                     border: Border.all(color: C.slate200.withOpacity(0.5)),
                   ),
                   child: rest.photoURL != null
-                      ? Image.network(rest.photoURL!, fit: BoxFit.cover)
+                      ? SmartImage(rest.photoURL, fit: BoxFit.cover)
                       : const Icon(LucideIcons.utensils,
                           size: 24, color: C.emerald600),
                 ),
@@ -983,6 +1265,10 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         onSelectDistrict: (d) => setState(() => _pickupDistrict = d),
         onSelectVillage: _onPickupVillageChanged,
         addressNoteCtrl: _pickupNoteCtrl,
+        pickedAddress: _pickupPoint?.displayText,
+        customPlaceName: _pickupPoint?.placeName,
+        customArea: _pickupPoint?.area,
+        onPickedOnMap: _onPickupPicked,
       ),
       const SizedBox(height: 20),
       LocationSelector(
@@ -995,6 +1281,10 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
         onSelectDistrict: (d) => setState(() => _dropoffDistrict = d),
         onSelectVillage: _onDropoffVillageChanged,
         addressNoteCtrl: _dropoffNoteCtrl,
+        pickedAddress: _dropoffPoint?.displayText,
+        customPlaceName: _dropoffPoint?.placeName,
+        customArea: _dropoffPoint?.area,
+        onPickedOnMap: _onDropoffPicked,
       ),
       const SizedBox(height: 20),
       Align(
@@ -1004,16 +1294,15 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
       ),
       const SizedBox(height: 8),
       _vehicleSelector(),
-      if (_pickupVillage != null && _dropoffVillage != null) ...[
+      if (_hasPickup && _hasDropoff) ...[
         const SizedBox(height: 20),
         _priceEstimateCard(),
       ],
       const SizedBox(height: 24),
       PressScale(
         onTap: (_isSubmitting ||
-                _dropoffVillage == null ||
-                (_selectedCategory == OrderCategory.taxi &&
-                    _pickupVillage == null) ||
+                !_hasDropoff ||
+                (_selectedCategory == OrderCategory.taxi && !_hasPickup) ||
                 _isCalculatingDist)
             ? null
             : () => _handleCreateOrder(),
@@ -1222,168 +1511,295 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
     }
   }
 
-  Future<void> _cancelPendingOrder(Order order) async {
+  bool _confirmingReceipt = false;
+  DateTime? _lastRouteAt;
+
+  Future<void> _confirmReceipt(Order order) async {
+    if (_confirmingReceipt) return;
+    setState(() => _confirmingReceipt = true);
     try {
-      await order_service.updateOrderStatus(
-          order.id, OrderStatus.cancelled, user.id, user.role);
-    } catch (_) {
-      if (mounted) showAppAlert(context, 'تعذر إلغاء الطلب');
+      await db.collection('orders').doc(order.id).update({
+        'customerReceived': true,
+        'customerReceivedAt': DateTime.now().millisecondsSinceEpoch,
+      });
+      if (order.driverId != null) {
+        await NotificationService.notifyUser(
+          userId: order.driverId!,
+          title: 'العميل أكد الاستلام ✅',
+          body: 'تقدر دلوقتي تضغط "تأكيد التسليم النهائي".',
+          type: 'SUCCESS',
+          key: 'received_${order.id}',
+          orderId: order.id,
+        );
+      }
+    } catch (e) {
+      if (mounted) showAppAlert(context, 'تعذر تأكيد الاستلام: ${friendlyError(e)}');
+    } finally {
+      if (mounted) setState(() => _confirmingReceipt = false);
     }
   }
 
-  Widget _offerCard(Offer offer, {required bool cheapest, required Order order}) {
-    final busy = _acceptingOfferId == offer.id;
+  Widget _receiptConfirmCard(Order order) {
+    final done = order.customerReceived;
     return Container(
-      margin: const EdgeInsets.only(bottom: 14),
-      padding: const EdgeInsets.all(16),
+      margin: const EdgeInsets.only(bottom: 24),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: C.white,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-            color: cheapest ? C.emerald500 : C.slate100,
-            width: cheapest ? 2 : 1),
-        boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.05)),
+        color: done ? C.emerald50 : C.white,
+        borderRadius: BorderRadius.circular(32),
+        border: Border.all(color: done ? C.emerald100 : C.emerald500, width: 2),
+        boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.06)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (cheapest)
-            Align(
-              alignment: Alignment.centerRight,
-              child: Container(
-                margin: const EdgeInsets.only(bottom: 10),
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                    color: C.emerald50,
-                    borderRadius: BorderRadius.circular(999)),
-                child: Text('الأقل سعراً',
-                    style: T.s(10, T.w900, C.emerald600)),
-              ),
-            ),
-          Row(
-            children: [
-              Container(
-                width: 48,
-                height: 48,
-                clipBehavior: Clip.antiAlias,
-                decoration: BoxDecoration(
-                    color: C.slate50, borderRadius: BorderRadius.circular(16)),
-                child: offer.driverPhoto != null
-                    ? Image.network(offer.driverPhoto!,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => const Icon(
-                            LucideIcons.user, color: C.slate400))
-                    : const Icon(LucideIcons.user, color: C.slate400),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(offer.driverName,
-                        style: T.s(14, T.w900, C.slate900)),
-                    const SizedBox(height: 2),
-                    Row(
-                      children: [
-                        const Icon(LucideIcons.star,
-                            size: 12, color: C.amber400),
-                        const SizedBox(width: 3),
-                        Text(
-                            offer.driverRating > 0
-                                ? offer.driverRating.toStringAsFixed(1)
-                                : '5.0',
-                            style: T.s(11, T.w900, C.amber500)),
-                        const SizedBox(width: 8),
-                        Text(offer.vehicleType.value,
-                            style: T.s(10, T.w700, C.slate400)),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Text('${offer.price.toInt()}',
-                      style: T.s(26, T.w900, C.slate950)),
-                  Text('ج.م', style: T.s(10, T.w700, C.slate400)),
-                ],
-              ),
+          Text(
+              done
+                  ? 'تم تأكيد استلامك ✅ — بانتظار تأكيد الكابتن النهائي'
+                  : 'استلمت طلبك؟ اضغط الزر عشان الكابتن يقدر يُنهي المشوار',
+              textAlign: TextAlign.center,
+              style: T.s(13, T.w900, done ? C.emerald700 : C.slate900,
+                  height: 1.5)),
+          if (done && order.driverId != null) ...[
+            const SizedBox(height: 18),
+            if (order.rating != null)
+              Text('شكرًا على تقييمك ⭐',
+                  textAlign: TextAlign.center,
+                  style: T.s(13, T.w900, C.emerald700))
+            else ...[
+              Text('قيّم الكابتن ${order.driverName ?? ""}',
+                  textAlign: TextAlign.center,
+                  style: T.s(14, T.w900, C.slate900)),
+              const SizedBox(height: 12),
+              _ratingForm(order, compact: true),
             ],
-          ),
-          const SizedBox(height: 14),
-          PressScale(
-            onTap: _acceptingOfferId != null ? null : () => _acceptOfferTapped(offer),
-            child: Container(
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: C.emerald600,
-                borderRadius: BorderRadius.circular(16),
-                boxShadow: Sh.lg(),
+          ],
+          if (!done) ...[
+            const SizedBox(height: 14),
+            PressScale(
+              onTap: _confirmingReceipt ? null : () => _confirmReceipt(order),
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 18),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: C.emerald600,
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: Sh.lg(),
+                ),
+                child: _confirmingReceipt
+                    ? const Spinner()
+                    : Text('تم الاستلام بالفعل',
+                        style: T.s(16, T.w900, C.white)),
               ),
-              child: busy
-                  ? const Spinner()
-                  : Text('قبول هذا السعر (${offer.price.toInt()} ج.م)',
-                      style: T.s(13, T.w900, C.white)),
             ),
-          ),
+          ],
         ],
       ),
     );
   }
 
-  Widget _waitingForOffersView(Order order) {
-    final offers = _sortedOffers;
+  Future<void> _cancelPendingOrder(Order order) async {
+    try {
+      await db
+          .collection('orders')
+          .doc(order.id)
+          .update({'status': OrderStatus.cancelled.value});
+    } catch (_) {
+      if (mounted) showAppAlert(context, 'تعذر إلغاء الطلب');
+    }
+  }
+
+
+  /// ترتيب العروض: الأرخص (الافتراضي) أو الأقرب لنقطة الاستلام/العميل.
+  List<Offer> _orderedOffers(Order order, Map<String, GeoFix> locs) {
+    final list = List<Offer>.of(_sortedOffers); // مرتبة بالسعر
+    if (!_offersByDistance) return list;
+    final ref = offersReferencePoint(order);
+    list.sort((a, b) {
+      final da = captainDistanceMeters(ref, locs[a.driverId]);
+      final dbm = captainDistanceMeters(ref, locs[b.driverId]);
+      if (da == null && dbm == null) return a.price.compareTo(b.price);
+      if (da == null) return 1; // اللي موقعه مجهول في الآخر
+      if (dbm == null) return -1;
+      final c = da.compareTo(dbm);
+      return c != 0 ? c : a.price.compareTo(b.price);
+    });
+    return list;
+  }
+
+  Widget _sortChip(String text, bool selected, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? C.emerald600 : C.white,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: selected ? C.emerald600 : C.slate200),
+        ),
+        child: Text(text,
+            style: T.s(11, T.w900, selected ? C.white : C.slate600)),
+      ),
+    );
+  }
+
+  /// قسم العروض: ترتيب (الأرخص/الأقرب) + خريطة أماكن الكباتن + كروت العروض.
+  Widget _offersSection(Order order, Map<String, GeoFix> locs) {
+    final offers = _orderedOffers(order, locs);
+    if (offers.isEmpty) return const SizedBox.shrink();
+    final ref = offersReferencePoint(order);
+    final nearestId = nearestOfferDriverId(ref, offers, locs);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Container(
-          padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            color: C.white,
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(color: C.emerald50, width: 3),
-            boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.08)),
-          ),
-          child: Column(
+        CaptainsOffersMap(order: order, offers: offers, locations: locs),
+        const SizedBox(height: 16),
+        if (offers.length > 1) ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
             children: [
-              Pulse(
-                  child: const Icon(LucideIcons.radar,
-                      size: 56, color: C.emerald600)),
-              const SizedBox(height: 12),
-              Text(
-                  offers.isEmpty
-                      ? 'جاري إرسال طلبك للكباتن...'
-                      : 'وصلك ${offers.length} عرض — اختار السعر المناسب',
-                  textAlign: TextAlign.center,
-                  style: T.s(18, T.w900, C.slate900)),
-              const SizedBox(height: 6),
-              Text('سعرك المقترح: ${order.price.toInt()} ج.م',
-                  style: T.s(12, T.w700, C.slate500)),
+              _sortChip('الأقرب', _offersByDistance,
+                  () => setState(() => _offersByDistance = true)),
+              const SizedBox(width: 8),
+              _sortChip('الأرخص', !_offersByDistance,
+                  () => setState(() => _offersByDistance = false)),
+              const SizedBox(width: 10),
+              Text('ترتيب العروض:', style: T.s(10, T.w800, C.slate400)),
             ],
           ),
-        ),
-        const SizedBox(height: 20),
-        if (offers.isEmpty)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Text('هتظهر العروض هنا أول ما الكباتن يردوا — هيجيلك إشعار.',
-                textAlign: TextAlign.center,
-                style: T.s(12, T.w500, C.slate400)),
+          const SizedBox(height: 12),
+        ],
+        for (final offer in offers)
+          _offerCard(order, offer, locs, nearestId),
+      ],
+    );
+  }
+
+  /// سطر المسافة + علامة "الأقرب" تحت اسم الكابتن في كارت العرض.
+  List<Widget> _offerDistanceWidgets(
+      Order order, Offer offer, Map<String, GeoFix> locs, String? nearestId) {
+    final ref = offersReferencePoint(order);
+    final fix = locs[offer.driverId];
+    final d = captainDistanceMeters(ref, fix);
+    final isNearest = nearestId == offer.driverId && d != null;
+    final toWhat = orderPickupPoint(order) != null ? 'نقطة الاستلام' : 'موقعك';
+    String text;
+    if (fix == null) {
+      text = 'موقعه غير متاح الآن';
+    } else if (d == null) {
+      text = 'موقعه ظاهر على الخريطة';
+    } else {
+      text = 'يبعد حوالي ${geo.formatDistance(d)} عن $toWhat';
+    }
+    return [
+      const SizedBox(height: 6),
+      Text(text,
+          textAlign: TextAlign.right,
+          style: T.s(10, T.w700, d == null ? C.slate300 : C.slate600)),
+      if (isNearest && _incomingOffers.map((o) => o.driverId).toSet().length > 1)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+            decoration: BoxDecoration(
+              color: C.emerald50,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: C.emerald500.withOpacity(0.4)),
+            ),
+            child: Text('الأقرب ✓', style: T.s(9, T.w900, C.emerald700)),
           ),
-        for (var i = 0; i < offers.length; i++)
-          _offerCard(offers[i], cheapest: i == 0 && offers.length > 1, order: order),
-        const SizedBox(height: 8),
+        ),
+    ];
+  }
+
+  Widget _offerCard(Order order, Offer offer, Map<String, GeoFix> locs,
+      String? nearestId) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: C.white,
+              borderRadius: BorderRadius.circular(32),
+              border: Border.all(color: C.emerald50, width: 2),
+              boxShadow: Sh.xl(color: C.emerald900.withOpacity(0.06)),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                PressScale(
+                  onTap: _acceptingOfferId != null ? null : () => _acceptOfferTapped(offer),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 24, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: C.emerald600,
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: Sh.lg(),
+                    ),
+                    child: _acceptingOfferId == offer.id
+                        ? const Spinner()
+                        : Text('قبول ${finalFare(offer.price).toInt()} ج.م',
+                            style: T.s(11, T.w900, C.white)),
+                  ),
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(offer.driverName, style: T.s(14, T.w900, C.slate900)),
+                    const SizedBox(height: 4),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(offer.driverRating > 0
+                                ? offer.driverRating.toStringAsFixed(1)
+                                : '5.0',
+                            style: T.s(10, T.w900, C.amber500)),
+                        const SizedBox(width: 2),
+                        const Icon(LucideIcons.star,
+                            size: 12, color: C.amber400),
+                      ],
+                    ),
+                    ..._offerDistanceWidgets(order, offer, locs, nearestId),
+                  ],
+                ),
+              ],
+            ),
+          ),
+    );
+  }
+
+  Widget _waitingForOffersView(Order order) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(48),
+          decoration: BoxDecoration(
+            color: C.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: C.emerald50, width: 4),
+            boxShadow: Sh.xxl(color: C.emerald900.withOpacity(0.1)),
+          ),
+          child: Pulse(
+              child: const Icon(LucideIcons.radar, size: 80, color: C.emerald600)),
+        ),
+        const SizedBox(height: 24),
+        Text('جاري البحث عن كباتن متاحين...',
+            textAlign: TextAlign.center,
+            style: T.s(24, T.w900, C.slate900, letterSpacing: -0.6)),
+        const SizedBox(height: 4),
+        Text('ستظهر العروض في الأسفل خلال لحظات',
+            style: T.s(11, T.w700, C.slate400)),
+        const SizedBox(height: 24),
+        ValueListenableBuilder<Map<String, GeoFix>>(
+          valueListenable: _captainLocs.locations,
+          builder: (context, locs, _) => _offersSection(order, locs),
+        ),
+        const SizedBox(height: 16),
         GestureDetector(
           onTap: () => _cancelPendingOrder(order),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Text('إلغاء الطلب',
-                textAlign: TextAlign.center,
-                style: T.s(12, T.w900, C.rose500, letterSpacing: 1.2)),
-          ),
+          child: Text('إلغاء الطلب',
+              style: T.s(11, T.w900, C.rose500, letterSpacing: 1.2)),
         ),
       ],
     );
@@ -1411,77 +1827,20 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
           const SizedBox(height: 32),
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.all(32),
+            padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
               color: C.slate50,
-              borderRadius: BorderRadius.circular(48),
+              borderRadius: BorderRadius.circular(40),
             ),
-            child: Column(
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    for (var s = 1; s <= 5; s++)
-                      GestureDetector(
-                        onTap: () => setState(() => _rating = s),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 6),
-                          child: Icon(LucideIcons.star,
-                              size: 48,
-                              color: _rating >= s ? C.amber400 : C.slate200),
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 40),
-                Container(
-                  decoration: BoxDecoration(
-                    color: C.white,
-                    borderRadius: BorderRadius.circular(32),
-                  ),
-                  constraints: const BoxConstraints(minHeight: 120),
-                  child: TextField(
-                    controller: _feedbackCtrl,
-                    maxLines: null,
-                    minLines: 4,
-                    textAlign: TextAlign.right,
-                    textDirection: TextDirection.rtl,
-                    style: T.s(13, T.w700, C.slate800),
-                    decoration: InputDecoration(
-                      border: InputBorder.none,
-                      hintText: 'هل لديك أي ملاحظات أخرى على الرحلة؟ (اختياري)',
-                      hintStyle: T.s(13, T.w700, C.gray400),
-                      contentPadding: const EdgeInsets.all(24),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            child: _ratingForm(order),
           ),
-          const SizedBox(height: 32),
-          PressScale(
-            onTap: _isRatingSubmitting ? null : _handleRateTrip,
-            child: Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 32),
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: const Color(0xFF10B981),
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: Sh.xxl(),
-              ),
-              child: _isRatingSubmitting
-                  ? const Spinner(size: 32)
-                  : Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(LucideIcons.thumbsUp,
-                            size: 24, color: C.white),
-                        const SizedBox(width: 12),
-                        Text('تأكيد وإرسال التقييم',
-                            style: T.s(24, T.w900, C.white)),
-                      ],
-                    ),
+          const SizedBox(height: 20),
+          GestureDetector(
+            onTap: _isRatingSubmitting ? null : () => _handleSkipRating(order),
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Text('تخطي التقييم',
+                  style: T.s(12, T.w900, C.slate400)),
             ),
           ),
         ],
@@ -1490,15 +1849,21 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
   }
 
   Widget _trackingView(BuildContext context, Order order) {
+    final isAssigned = order.status == OrderStatus.assigned;
+    // نقطة الاستلام الحقيقية بس. الصيدلية/الطلب اليدوي مالهمش مكان معروف، فمنعرضش
+    // علامة استلام في مكان غلط (ولا بنرسم مسار ليه).
+    final pickupPt = orderPickupPoint(order);
+    final dropPt = orderDropoffPoint(order);
+    final fitTarget = (isAssigned ? pickupPt : dropPt) ?? dropPt;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         if (_driverLoc != null) ...[
           Container(
-            height: MediaQuery.of(context).size.height * 0.42,
+            height: MediaQuery.of(context).size.height * 0.45,
             clipBehavior: Clip.antiAlias,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(28),
+              borderRadius: BorderRadius.circular(72),
               border: Border.all(color: C.white, width: 4),
               boxShadow: Sh.xxl(),
             ),
@@ -1509,18 +1874,15 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                   zoom: 15,
                   markers: [
                     driverMarker(_driverLoc!),
-                    order.status == OrderStatus.assigned
-                        ? pickupPointMarker(
-                            ll.LatLng(order.pickup.lat, order.pickup.lng))
-                        : customerHomeMarker(
-                            ll.LatLng(order.dropoff.lat, order.dropoff.lng)),
+                    if (isAssigned && pickupPt != null)
+                      pickupPointMarker(pickupPt),
+                    if (dropPt != null && (!isAssigned || pickupPt == null))
+                      customerHomeMarker(dropPt),
                   ],
                   routeGeometry: _routeGeometry,
                   fitPoints: [
                     _driverLoc!,
-                    order.status == OrderStatus.assigned
-                        ? ll.LatLng(order.pickup.lat, order.pickup.lng)
-                        : ll.LatLng(order.dropoff.lat, order.dropoff.lng),
+                    if (fitTarget != null) fitTarget,
                   ],
                 ),
                 Positioned(
@@ -1602,6 +1964,9 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
           ),
           const SizedBox(height: 32),
         ],
+        if (order.status == OrderStatus.picked ||
+            order.status == OrderStatus.inDelivery)
+          _receiptConfirmCard(order),
         Container(
           padding: const EdgeInsets.all(32),
           decoration: BoxDecoration(
@@ -1628,8 +1993,8 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                       style: T.s(11, T.w900, C.white.withOpacity(0.6),
                           letterSpacing: 1.2)),
                   const SizedBox(height: 2),
-                  Text(order.status.value,
-                      style: T.s(22, T.w900, C.white)),
+                  Text(order.status.labelAr,
+                      style: T.s(18, T.w900, C.white)),
                 ],
               ),
             ],
@@ -1649,7 +2014,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                 boxShadow: Sh.xxl(),
               ),
               child: order.driverPhoto != null
-                  ? Image.network(order.driverPhoto!, fit: BoxFit.cover)
+                  ? SmartImage(order.driverPhoto, fit: BoxFit.cover)
                   : Center(
                       child: Text(
                           (order.driverName?.isNotEmpty ?? false)
@@ -1835,8 +2200,9 @@ class AdsSlider extends StatelessWidget {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Image.network(ad.imageUrl, fit: BoxFit.cover,
-                      opacity: const AlwaysStoppedAnimation(0.8)),
+                  Opacity(
+                      opacity: 0.8,
+                      child: SmartImage(ad.imageUrl, fit: BoxFit.cover)),
                   DecoratedBox(
                     decoration: BoxDecoration(
                       gradient: LinearGradient(
@@ -1887,7 +2253,11 @@ class AdsSlider extends StatelessWidget {
 class AdDetailsView extends StatelessWidget {
   final Ad ad;
   final VoidCallback onClose;
-  const AdDetailsView({super.key, required this.ad, required this.onClose});
+
+  /// لو الإعلان مربوط بمطعم: زر "اطلب الآن" بيفتح صفحة المطعم.
+  final VoidCallback? onOrderNow;
+  const AdDetailsView(
+      {super.key, required this.ad, required this.onClose, this.onOrderNow});
 
   @override
   Widget build(BuildContext context) {
@@ -1917,7 +2287,7 @@ class AdDetailsView extends StatelessWidget {
                         children: [
                           AspectRatio(
                             aspectRatio: 21 / 9,
-                            child: Image.network(ad.imageUrl, fit: BoxFit.cover),
+                            child: SmartImage(ad.imageUrl, fit: BoxFit.cover),
                           ),
                           Positioned(
                             top: 24,
@@ -1966,14 +2336,49 @@ class AdDetailsView extends StatelessWidget {
                                   textAlign: TextAlign.right,
                                   style: T.s(13, T.w700, C.slate500,
                                       height: 1.7)),
-                              if (ad.whatsappNumber != null) ...[
+                              if (onOrderNow != null) ...[
+                                const SizedBox(height: 24),
+                                PressScale(
+                                  onTap: onOrderNow!,
+                                  child: Container(
+                                    width: double.infinity,
+                                    padding:
+                                        const EdgeInsets.symmetric(vertical: 24),
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: C.emerald600,
+                                      borderRadius: BorderRadius.circular(32),
+                                      boxShadow: Sh.xl(),
+                                    ),
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        const Icon(LucideIcons.utensils,
+                                            size: 24, color: C.white),
+                                        const SizedBox(width: 16),
+                                        Text(
+                                            ad.ctaText.isNotEmpty &&
+                                                    ad.ctaText !=
+                                                        'استفد من العرض الآن'
+                                                ? ad.ctaText
+                                                : 'اطلب الآن',
+                                            style: T.s(16, T.w900, C.white)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                              if ((ad.whatsappNumber ?? '').isNotEmpty) ...[
                                 const SizedBox(height: 24),
                                 PressScale(
                                   onTap: () async {
-                                    await db
-                                        .collection('ads')
-                                        .doc(ad.id)
-                                        .update({'clicks': FieldValue.increment(1)});
+                                    try {
+                                      await db
+                                          .collection('ads')
+                                          .doc(ad.id)
+                                          .update(
+                                              {'clicks': FieldValue.increment(1)});
+                                    } catch (_) {}
                                     final uri = Uri.parse(
                                         'https://wa.me/${ad.whatsappNumber}');
                                     await launchUrl(uri,
@@ -2059,6 +2464,16 @@ class LocationSelector extends StatefulWidget {
   final TextEditingController? addressNoteCtrl;
   final bool minimal;
 
+  /// لو اتحدد: بيظهر زرّين (موقعي الحالي / من الخريطة) والنتيجة بترجع هنا.
+  final void Function(PickedPlace)? onPickedOnMap;
+
+  /// عنوان النقطة المختارة (للعرض تحت الأزرار).
+  final String? pickedAddress;
+
+  /// اسم المكان الفعلي لو مش موجود في القوائم (بيظهر مكان اسم القرية).
+  final String? customPlaceName;
+  final String? customArea;
+
   const LocationSelector({
     super.key,
     required this.label,
@@ -2071,6 +2486,10 @@ class LocationSelector extends StatefulWidget {
     required this.onSelectVillage,
     this.addressNoteCtrl,
     this.minimal = false,
+    this.onPickedOnMap,
+    this.pickedAddress,
+    this.customPlaceName,
+    this.customArea,
   });
 
   @override
@@ -2080,6 +2499,67 @@ class LocationSelector extends StatefulWidget {
 class _LocationSelectorState extends State<LocationSelector> {
   bool _showDistricts = false;
   bool _showVillages = false;
+  bool _locating = false;
+
+  Future<void> _useMyLocation() async {
+    if (_locating) return;
+    setState(() => _locating = true);
+    try {
+      final r = await fetchCurrentLocation();
+      if (!mounted) return;
+      if (r.place != null) {
+        widget.onPickedOnMap?.call(r.place!);
+      } else {
+        showAppAlert(context, r.error ?? 'تعذّر تحديد موقعك');
+      }
+    } finally {
+      if (mounted) setState(() => _locating = false);
+    }
+  }
+
+  Future<void> _pickOnMap() async {
+    final sel = await pickLocationOnMap(context);
+    if (sel != null && mounted) widget.onPickedOnMap?.call(sel);
+  }
+
+  Widget _mapActionButton({
+    required IconData icon,
+    required String text,
+    required VoidCallback? onTap,
+    bool loading = false,
+  }) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
+          decoration: BoxDecoration(
+            color: C.emerald500.withOpacity(0.08),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: C.emerald500.withOpacity(0.35)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (loading)
+                const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+              else
+                Icon(icon, size: 16, color: C.emerald600),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(text,
+                    overflow: TextOverflow.ellipsis,
+                    style: T.s(11, T.w800, C.emerald700)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   Future<void> _pickDistrict() async {
     final picked = await _showPicker(
@@ -2091,8 +2571,10 @@ class _LocationSelectorState extends State<LocationSelector> {
   }
 
   Future<void> _pickVillage() async {
-    final d = widget.selectedDistrict;
-    if (d == null) return;
+    final sel = widget.selectedDistrict;
+    if (sel == null) return;
+    // نجيب نسخة المركز المحدّثة (ممكن الأدمن يكون ضاف قرى بعد اختياره)
+    final d = menofiaData.firstWhere((e) => e.id == sel.id, orElse: () => sel);
     final picked = await _showPicker(d.villages.map((v) => v.name).toList());
     if (picked != null) {
       final v = d.villages.firstWhere((e) => e.name == picked);
@@ -2173,11 +2655,49 @@ class _LocationSelectorState extends State<LocationSelector> {
             ),
             const SizedBox(height: 16),
           ],
+          if (widget.onPickedOnMap != null) ...[
+            Row(
+              children: [
+                _mapActionButton(
+                  icon: Icons.my_location_rounded,
+                  text: 'موقعي الحالي',
+                  loading: _locating,
+                  onTap: _useMyLocation,
+                ),
+                const SizedBox(width: 12),
+                _mapActionButton(
+                  icon: LucideIcons.mapPin,
+                  text: 'اختيار من الخريطة',
+                  onTap: _pickOnMap,
+                ),
+              ],
+            ),
+            if (widget.pickedAddress != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(LucideIcons.checkCircle2,
+                      size: 14, color: C.emerald600),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(widget.pickedAddress!,
+                        textAlign: TextAlign.right,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: T.s(10, T.w600, C.slate600)),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 12),
+          ],
           Row(
             children: [
               Expanded(
                 child: _dropdownButton(
-                  text: widget.selectedVillage?.name ?? 'اختر القرية',
+                  text: widget.selectedVillage?.name ??
+                      widget.customPlaceName ??
+                      'اختر القرية',
                   enabled: widget.selectedDistrict != null,
                   open: _showVillages,
                   onTap: widget.selectedDistrict == null
@@ -2194,7 +2714,9 @@ class _LocationSelectorState extends State<LocationSelector> {
               const SizedBox(width: 12),
               Expanded(
                 child: _dropdownButton(
-                  text: widget.selectedDistrict?.name ?? 'اختر المركز',
+                  text: widget.selectedDistrict?.name ??
+                      widget.customArea ??
+                      'اختر المركز',
                   enabled: true,
                   open: _showDistricts,
                   onTap: () {
@@ -2280,15 +2802,24 @@ class RestaurantMenuView extends StatefulWidget {
   final Restaurant restaurant;
   final Village? initialDropoffVillage;
   final District? initialDistrict;
+  final PickedPlace? initialDropoffPoint;
   final VoidCallback onClose;
-  final void Function(List<CartItem> cart, double foodTotal, double deliveryTotal,
-      double grandTotal, double distance, Village village, String specialRequest) onConfirmOrder;
+  final void Function(
+      List<CartItem> cart,
+      double foodTotal,
+      double deliveryTotal,
+      double grandTotal,
+      double distance,
+      Village? village,
+      PickedPlace? point,
+      String specialRequest) onConfirmOrder;
 
   const RestaurantMenuView({
     super.key,
     required this.restaurant,
     required this.initialDropoffVillage,
     required this.initialDistrict,
+    this.initialDropoffPoint,
     required this.onClose,
     required this.onConfirmOrder,
   });
@@ -2298,6 +2829,14 @@ class RestaurantMenuView extends StatefulWidget {
 }
 
 class _RestaurantMenuViewState extends State<RestaurantMenuView> {
+  bool _onBack() {
+    if (_showFullMenuImage) {
+      setState(() => _showFullMenuImage = false);
+      return true;
+    }
+    return false;
+  }
+
   final List<CartItem> _cart = [];
   final _specialRequestCtrl = TextEditingController();
   bool _showFullMenuImage = false;
@@ -2307,45 +2846,68 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
   District? _currentDistrict;
   Village? _currentVillage;
 
+  /// مكان التوصيل لو اتحدد بالـ GPS أو من الخريطة (بيتقدّم على القرية).
+  PickedPlace? _point;
+
   @override
   void initState() {
     super.initState();
+    BackInterceptor.register(_onBack);
     _currentDistrict = widget.initialDistrict;
     _currentVillage = widget.initialDropoffVillage;
-    if (_currentVillage != null) _recalc();
+    _point = widget.initialDropoffPoint;
+    if (_currentVillage != null || _point != null) _recalc();
   }
 
   @override
   void dispose() {
+    BackInterceptor.unregister(_onBack);
     _specialRequestCtrl.dispose();
     super.dispose();
   }
 
+  int _calcReq = 0;
+
   Future<void> _recalc() async {
+    final req = ++_calcReq;
+    final pt = _point;
     final v = _currentVillage;
-    if (v == null) return;
+    final lat = pt?.latitude ?? v?.center.lat;
+    final lng = pt?.longitude ?? v?.center.lng;
+    if (lat == null || lng == null) {
+      setState(() {
+        _roadDist = 0;
+        _isCalculating = false;
+      });
+      return;
+    }
     setState(() => _isCalculating = true);
     try {
-      final res = await utils.getRoadDistance(widget.restaurant.lat,
-          widget.restaurant.lng, v.center.lat, v.center.lng);
-      if (mounted) {
+      final res = await utils.getRoadDistance(
+          widget.restaurant.lat, widget.restaurant.lng, lat, lng);
+      if (mounted && req == _calcReq) {
         setState(() {
           _roadDist = res.distance;
           _isCalculating = false;
         });
       }
     } catch (_) {
-      if (mounted) setState(() => _isCalculating = false);
+      if (mounted && req == _calcReq) setState(() => _isCalculating = false);
     }
   }
 
+  // أصناف قديمة ممكن تكون من غير id فكلها كانت بتتحسب كصنف واحد.
+  String _keyOf(MenuItem item) =>
+      item.id.isNotEmpty ? item.id : '${item.name}_${item.price}';
+
   void _addToCart(MenuItem item) {
+    final key = _keyOf(item);
     setState(() {
-      final i = _cart.indexWhere((e) => e.id == item.id);
+      final i = _cart.indexWhere((e) => e.id == key);
       if (i >= 0) {
         _cart[i] = _cart[i].copyWith(quantity: _cart[i].quantity + 1);
       } else {
-        _cart.add(CartItem(id: item.id, name: item.name, price: item.price, quantity: 1));
+        _cart.add(CartItem(id: key, name: item.name, price: item.price, quantity: 1));
       }
     });
   }
@@ -2368,15 +2930,12 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
       _cart.fold(0.0, (sum, i) => sum + i.price * i.quantity);
 
   double get _deliveryPrice {
-    final v = _currentVillage;
-    if (v == null) return 0;
-    final isSameVillage = widget.restaurant.address == v.name;
-    if (isSameVillage) return configDefaultPricing.sameVillagePrice;
+    final destName = _currentVillage?.name ?? _point?.placeName;
+    if (destName == null) return 0;
+    final isSameVillage = widget.restaurant.address == destName;
+    if (isSameVillage) return finalFare(configDefaultPricing.sameVillagePrice);
     final calc = _roadDist * configDefaultPricing.foodOutsidePricePerKm;
-    final rounded = calc.roundToDouble();
-    return rounded < configDefaultPricing.minPrice
-        ? configDefaultPricing.minPrice
-        : rounded;
+    return finalFare(calc.roundToDouble());
   }
 
   double get _finalEstimatedPrice => _totalFoodItemsPrice + _deliveryPrice;
@@ -2384,7 +2943,7 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
   @override
   Widget build(BuildContext context) {
     return Positioned.fill(
-      child: Material(
+      child: _withMenuViewer(Material(
         color: C.white,
         child: Column(
           children: [
@@ -2394,10 +2953,10 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  Image.network(
-                    widget.restaurant.photoURL ??
-                        'https://images.unsplash.com/photo-1517248135467-4c7ed9d42339',
+                  SmartImage(
+                    widget.restaurant.photoURL,
                     fit: BoxFit.cover,
+                    placeholder: Container(color: C.slate900),
                   ),
                   const DecoratedBox(
                     decoration: BoxDecoration(
@@ -2482,9 +3041,23 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                         selectedVillage: _currentVillage,
                         onSelectDistrict: (d) => setState(() => _currentDistrict = d),
                         onSelectVillage: (v) {
-                          setState(() => _currentVillage = v);
+                          setState(() {
+                            _currentVillage = v;
+                            _point = null; // اختار قرية يدويًا: نرجع لمركز القرية
+                          });
                           _recalc();
                         },
+                        onPickedOnMap: (pl) {
+                          setState(() {
+                            _point = pl;
+                            _currentDistrict = pl.knownMatch?.district;
+                            _currentVillage = pl.knownMatch?.village;
+                          });
+                          _recalc();
+                        },
+                        pickedAddress: _point?.displayText,
+                        customPlaceName: _point?.placeName,
+                        customArea: _point?.area,
                         minimal: true,
                       ),
                       if (widget.restaurant.menuImageURL != null) ...[
@@ -2642,7 +3215,7 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                             crossAxisAlignment: CrossAxisAlignment.end,
                             children: [
                               Text(
-                                  'التوصيل لـ ${_currentVillage?.name ?? "..."}',
+                                  'التوصيل لـ ${_currentVillage?.name ?? _point?.placeName ?? "..."}',
                                   overflow: TextOverflow.ellipsis,
                                   style: T.s(9, T.w900, C.slate400,
                                       letterSpacing: 1.2)),
@@ -2660,7 +3233,7 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                   ),
                   const SizedBox(height: 20),
                   PressScale(
-                    onTap: (_currentVillage == null ||
+                    onTap: ((_currentVillage == null && _point == null) ||
                             (_cart.isEmpty && _specialRequestCtrl.text.isEmpty) ||
                             _isCalculating)
                         ? null
@@ -2670,7 +3243,8 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                               _deliveryPrice,
                               _finalEstimatedPrice,
                               _roadDist,
-                              _currentVillage!,
+                              _currentVillage,
+                              _point,
                               _specialRequestCtrl.text,
                             ),
                     child: Container(
@@ -2700,7 +3274,60 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
             ),
           ],
         ),
-      ),
+      )),
+    );
+  }
+
+  List<String> get _menuImages {
+    final r = widget.restaurant;
+    final list = <String>[
+      ...?r.menuImageURLs,
+      if (r.menuImageURL != null && r.menuImageURL!.isNotEmpty) r.menuImageURL!,
+    ].where((e) => e.trim().isNotEmpty).toList();
+    return list.toSet().toList();
+  }
+
+  Widget _withMenuViewer(Widget body) {
+    return Stack(
+      children: [
+        body,
+        if (_showFullMenuImage)
+          Positioned.fill(
+            child: Material(
+              color: const Color(0xF2000000),
+              child: Stack(
+                children: [
+                  PageView(
+                    children: [
+                      for (final img in _menuImages)
+                        InteractiveViewer(
+                          minScale: 1,
+                          maxScale: 5,
+                          child: Center(child: SmartImage(img, fit: BoxFit.contain)),
+                        ),
+                    ],
+                  ),
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 12,
+                    right: 16,
+                    child: PressScale(
+                      onTap: () => setState(() => _showFullMenuImage = false),
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                            color: C.white.withOpacity(0.2),
+                            shape: BoxShape.circle),
+                        child: const Icon(Icons.close_rounded,
+                            size: 26, color: C.white),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -2741,12 +3368,12 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
   }
 
   Widget _menuItemRow(MenuItem item) {
-    final qty = _cart.firstWhere((e) => e.id == item.id,
+    final qty = _cart.firstWhere((e) => e.id == _keyOf(item),
             orElse: () => const CartItem(id: '', name: '', price: 0, quantity: 0))
         .quantity;
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: C.white,
         borderRadius: BorderRadius.circular(44),
@@ -2764,17 +3391,19 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
             child: Row(
               children: [
                 PressScale(
-                  scale: 0.75,
+                  scale: 0.9,
                   onTap: () => _addToCart(item),
                   child: Container(
-                    padding: const EdgeInsets.all(12),
+                    width: 40,
+                    height: 40,
+                    alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: C.emerald500,
-                      borderRadius: BorderRadius.circular(12),
+                      color: C.emerald600,
+                      borderRadius: BorderRadius.circular(14),
                       boxShadow: Sh.lg(),
                     ),
-                    child: const Icon(LucideIcons.plus,
-                        size: 20, color: C.white),
+                    child: const Icon(Icons.add_rounded,
+                        size: 28, color: C.white),
                   ),
                 ),
                 SizedBox(
@@ -2784,45 +3413,54 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                       style: T.s(20, T.w900, C.slate800)),
                 ),
                 PressScale(
-                  scale: 0.75,
-                  onTap: () => _removeFromCart(item.id),
+                  scale: 0.9,
+                  onTap: qty > 0 ? () => _removeFromCart(_keyOf(item)) : null,
                   child: Container(
-                    padding: const EdgeInsets.all(12),
+                    width: 40,
+                    height: 40,
+                    alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: C.rose50,
-                      borderRadius: BorderRadius.circular(12),
+                      color: qty > 0 ? C.rose500 : C.slate200,
+                      borderRadius: BorderRadius.circular(14),
                     ),
-                    child: const Icon(LucideIcons.minus,
-                        size: 20, color: C.rose500),
+                    child: Icon(Icons.remove_rounded,
+                        size: 28, color: qty > 0 ? C.white : C.slate400),
                   ),
                 ),
               ],
             ),
           ),
-          const Spacer(),
-          Row(
-            children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Text(item.name,
-                      style: T.s(17, T.w900, C.slate900, height: 1.2)),
-                  const SizedBox(height: 4),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
+          const SizedBox(width: 12),
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
-                      Text(item.price.toStringAsFixed(0),
-                          style: T.s(13, T.w900, C.emerald600)),
-                      const SizedBox(width: 4),
-                      Text('ج.م',
-                          style: T.s(10, T.w900,
-                              C.emerald600.withOpacity(0.6))),
+                      Text(item.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.right,
+                          style: T.s(16, T.w900, C.slate900, height: 1.2)),
+                      const SizedBox(height: 4),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(item.price.toStringAsFixed(0),
+                              style: T.s(13, T.w900, C.emerald600)),
+                          const SizedBox(width: 4),
+                          Text('ج.م',
+                              style: T.s(10, T.w900,
+                                  C.emerald600.withOpacity(0.6))),
+                        ],
+                      ),
                     ],
                   ),
-                ],
-              ),
-              const SizedBox(width: 16),
-              Container(
+                ),
+                const SizedBox(width: 12),
+                Container(
                 width: 64,
                 height: 64,
                 clipBehavior: Clip.antiAlias,
@@ -2832,11 +3470,12 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
                   border: Border.all(color: C.slate50),
                 ),
                 child: item.photoURL != null
-                    ? Image.network(item.photoURL!, fit: BoxFit.cover)
+                    ? SmartImage(item.photoURL, fit: BoxFit.cover)
                     : Icon(LucideIcons.utensils,
                         size: 24, color: C.slate200),
               ),
-            ],
+              ],
+            ),
           ),
         ],
       ),
@@ -2849,9 +3488,15 @@ class _RestaurantMenuViewState extends State<RestaurantMenuView> {
 class ManualRestaurantData {
   final String name;
   final String items;
-  final Village village;
+  final Village? village;
+
+  /// مكان التوصيل لو اتحدد بالـ GPS أو من الخريطة.
+  final PickedPlace? point;
   const ManualRestaurantData(
-      {required this.name, required this.items, required this.village});
+      {required this.name,
+      required this.items,
+      required this.village,
+      this.point});
 }
 
 class ManualRestaurantView extends StatefulWidget {
@@ -2869,6 +3514,7 @@ class _ManualRestaurantViewState extends State<ManualRestaurantView> {
   final _itemsCtrl = TextEditingController();
   District? _district;
   Village? _village;
+  PickedPlace? _point;
 
   @override
   void dispose() {
@@ -2881,7 +3527,7 @@ class _ManualRestaurantViewState extends State<ManualRestaurantView> {
   Widget build(BuildContext context) {
     final canSubmit = _restNameCtrl.text.isNotEmpty &&
         _itemsCtrl.text.isNotEmpty &&
-        _village != null;
+        (_village != null || _point != null);
     return Positioned.fill(
       child: Material(
         color: C.slate50,
@@ -3016,7 +3662,18 @@ class _ManualRestaurantViewState extends State<ManualRestaurantView> {
                       selectedDistrict: _district,
                       selectedVillage: _village,
                       onSelectDistrict: (d) => setState(() => _district = d),
-                      onSelectVillage: (v) => setState(() => _village = v),
+                      onSelectVillage: (v) => setState(() {
+                        _village = v;
+                        _point = null;
+                      }),
+                      onPickedOnMap: (pl) => setState(() {
+                        _point = pl;
+                        _district = pl.knownMatch?.district;
+                        _village = pl.knownMatch?.village;
+                      }),
+                      pickedAddress: _point?.displayText,
+                      customPlaceName: _point?.placeName,
+                      customArea: _point?.area,
                       minimal: true,
                     ),
                   ],
@@ -3036,7 +3693,8 @@ class _ManualRestaurantViewState extends State<ManualRestaurantView> {
                     : () => widget.onConfirm(ManualRestaurantData(
                         name: _restNameCtrl.text,
                         items: _itemsCtrl.text,
-                        village: _village!)),
+                        village: _village,
+                        point: _point)),
                 child: Container(
                   width: double.infinity,
                   padding: const EdgeInsets.symmetric(vertical: 28),

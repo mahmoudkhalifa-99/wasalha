@@ -1,3 +1,4 @@
+import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -27,7 +28,16 @@ class _AdminEditUserState extends State<AdminEditUser> {
   final _nameCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
-  final _passwordCtrl = TextEditingController();
+  bool _sendingReset = false;
+
+  bool get _originallySuspended =>
+      _targetUser?.status == UserStatus.suspended;
+
+  /// التعطيل: للمدير بس، ومش للمديرين التانيين ولا لحسابه هو.
+  bool get _canSuspend =>
+      _targetUser != null &&
+      _targetUser!.role != UserRole.admin &&
+      widget.userId != auth.currentUser?.uid;
   final _balanceCtrl = TextEditingController(text: '0');
   UserRole _role = UserRole.customer;
   UserStatus _status = UserStatus.approved;
@@ -58,7 +68,6 @@ class _AdminEditUserState extends State<AdminEditUser> {
     _nameCtrl.dispose();
     _phoneCtrl.dispose();
     _emailCtrl.dispose();
-    _passwordCtrl.dispose();
     _balanceCtrl.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -96,6 +105,31 @@ class _AdminEditUserState extends State<AdminEditUser> {
     }
   }
 
+  /// تغيير كلمة المرور الحقيقي يتم عبر رابط إعادة تعيين من Firebase Auth
+  /// (مفيش تخزين لكلمات المرور في Firestore).
+  Future<void> _sendResetEmail() async {
+    final email = _emailCtrl.text.trim();
+    if (_sendingReset) return;
+    if (!email.contains('@')) {
+      await showAppAlert(context, 'البريد الإلكتروني غير صحيح');
+      return;
+    }
+    setState(() => _sendingReset = true);
+    try {
+      await auth.sendPasswordResetEmail(email: email);
+      if (mounted) {
+        await showAppAlert(
+            context, 'تم إرسال رابط إعادة تعيين كلمة المرور إلى $email');
+      }
+    } catch (e) {
+      if (mounted) {
+        await showAppAlert(context, 'تعذر إرسال الرابط: ${friendlyError(e)}');
+      }
+    } finally {
+      if (mounted) setState(() => _sendingReset = false);
+    }
+  }
+
   Future<void> _handleUpdate() async {
     if (_isSaving) return;
     setState(() => _isSaving = true);
@@ -105,11 +139,11 @@ class _AdminEditUserState extends State<AdminEditUser> {
         'phone': _phoneCtrl.text,
         'email': _emailCtrl.text,
         'role': _role.value,
-        'status': _status.value,
       };
-      if (_passwordCtrl.text.trim().isNotEmpty) {
-        updates['password'] = _passwordCtrl.text;
-      }
+      // الحساب المعطّل مينفعش يتفعّل من التطبيق، بس المطوّر يرجّعه
+      if (!_originallySuspended) updates['status'] = _status.value;
+      // تنظيف أي كلمة مرور قديمة مخزنة كنص في وثيقة المستخدم
+      updates['password'] = FieldValue.delete();
       if (_role == UserRole.driver) {
         updates['vehicleType'] = _vehicleType.value;
       }
@@ -430,13 +464,38 @@ class _AdminEditUserState extends State<AdminEditUser> {
         final password = Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _labeledField('تعيين كلمة مرور جديدة', _passwordCtrl,
-                ltr: true, icon: LucideIcons.lock),
+            Text('كلمة المرور', style: T.s(10, T.w800, C.slate500)),
+            const SizedBox(height: 6),
+            PressScale(
+              scale: 0.97,
+              onTap: _sendingReset ? null : _sendResetEmail,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                decoration: BoxDecoration(
+                  color: C.slate50,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: C.slate200),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(LucideIcons.mail, size: 16, color: C.indigo500),
+                    const SizedBox(width: 8),
+                    Text(
+                        _sendingReset
+                            ? 'جارٍ الإرسال...'
+                            : 'إرسال رابط إعادة تعيين كلمة المرور',
+                        style: T.s(11, T.w800, C.slate700)),
+                  ],
+                ),
+              ),
+            ),
             const SizedBox(height: 4),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Text('تنبيه: سيتم تسجيل الدخول بالباسورد الجديد فوراً.',
-                  style: T.s(8, T.w700, C.rose400)),
+              child: Text('سيصل المستخدم رابط على بريده لتعيين كلمة مرور جديدة.',
+                  style: T.s(8, T.w700, C.slate400)),
             ),
           ],
         );
@@ -561,16 +620,30 @@ class _AdminEditUserState extends State<AdminEditUser> {
           },
           onChanged: (v) => setState(() => _role = v),
         );
-        final statusField = _dropdownField<UserStatus>(
-          label: 'حالة الحساب (Activation)',
-          value: _status,
-          items: const {
-            UserStatus.approved: 'مفعل (نشط الآن)',
-            UserStatus.pendingApproval: 'معلق (بانتظار مراجعة)',
-            UserStatus.suspended: 'محظور (موقوف مؤقتاً)',
-          },
-          onChanged: (v) => setState(() => _status = v),
-        );
+        final Widget statusField = _originallySuspended
+            ? _lockedStatusField()
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _dropdownField<UserStatus>(
+                    label: 'حالة الحساب (Activation)',
+                    value: _status,
+                    items: {
+                      UserStatus.approved: 'مفعل (نشط الآن)',
+                      if (_canSuspend)
+                        UserStatus.suspended: 'معطّل (لا رجوع إلا للمطوّر)',
+                    },
+                    onChanged: (v) => setState(() => _status = v),
+                  ),
+                  if (_status == UserStatus.suspended)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6, left: 4, right: 4),
+                      child: Text(
+                          'تنبيه: لو عطّلت الحساب، المستخدم مش هيقدر يدخل التطبيق، ومحدش يقدر يرجّعه غير المطوّر.',
+                          style: T.s(9, T.w800, C.rose500)),
+                    ),
+                ],
+              );
         return twoCol
             ? Row(children: [
                 Expanded(child: roleField),
@@ -583,6 +656,32 @@ class _AdminEditUserState extends State<AdminEditUser> {
                 statusField
               ]);
       }),
+    );
+  }
+
+  Widget _lockedStatusField() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text('حالة الحساب (Activation)',
+              textAlign: TextAlign.right,
+              style: T.s(10, T.w900, C.slate400)),
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: C.rose50,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: C.rose200),
+          ),
+          child: Text('معطّل — إعادة التفعيل من المطوّر فقط',
+              textAlign: TextAlign.right,
+              style: T.s(13, T.w900, C.rose500)),
+        ),
+      ],
     );
   }
 

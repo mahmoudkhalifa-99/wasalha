@@ -13,6 +13,8 @@ import '../../theme/app_colors.dart';
 import '../../theme/app_shadows.dart';
 import '../../theme/app_text.dart';
 import '../../widgets/common.dart';
+import 'broadcast_dialog.dart';
+import 'reviews_view.dart';
 
 String _districtNameFor(String? villageName) {
   if (villageName == null) return 'المنوفية';
@@ -31,7 +33,7 @@ class OperatorDashboard extends StatefulWidget {
   State<OperatorDashboard> createState() => _OperatorDashboardState();
 }
 
-enum _OpTab { live, drivers, history }
+enum _OpTab { live, drivers, history, reviews }
 
 class _OperatorDashboardState extends State<OperatorDashboard> {
   List<Order> _orders = [];
@@ -161,6 +163,7 @@ class _OperatorDashboardState extends State<OperatorDashboard> {
                     if (_activeTab == _OpTab.live) _liveTab(context),
                     if (_activeTab == _OpTab.history) _historyTab(),
                     if (_activeTab == _OpTab.drivers) _driversTab(context),
+                    if (_activeTab == _OpTab.reviews) ReviewsView(user: widget.user),
                   ],
                 ),
               ),
@@ -168,21 +171,21 @@ class _OperatorDashboardState extends State<OperatorDashboard> {
           ),
           if (_showScrollTop)
             Positioned(
-              bottom: 40,
-              left: 40,
+              bottom: 24,
+              left: 24,
               child: PressScale(
                 onTap: () => _scrollController.animateTo(0,
                     duration: const Duration(milliseconds: 400),
                     curve: Curves.easeOut),
                 child: Container(
-                  padding: const EdgeInsets.all(24),
+                  padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
                     color: C.slate900,
                     shape: BoxShape.circle,
                     boxShadow: Sh.xxl(),
                   ),
                   child: const Icon(LucideIcons.arrowUp,
-                      size: 32, color: C.white),
+                      size: 24, color: C.white),
                 ),
               ),
             ),
@@ -244,20 +247,44 @@ class _OperatorDashboardState extends State<OperatorDashboard> {
             ],
           ),
           Container(
-            padding: const EdgeInsets.all(8),
+            width: double.infinity,
+            padding: const EdgeInsets.all(6),
             decoration: BoxDecoration(
               color: C.slate50,
-              borderRadius: BorderRadius.circular(32),
+              borderRadius: BorderRadius.circular(28),
             ),
             child: Row(
-              mainAxisSize: MainAxisSize.min,
               children: [
-                _tabChip(_OpTab.history, LucideIcons.clock, 'السجل', null),
-                const SizedBox(width: 8),
-                _tabChip(_OpTab.drivers, LucideIcons.bike, 'الكباتن', approvedCount),
-                const SizedBox(width: 8),
-                _tabChip(_OpTab.live, LucideIcons.zap, 'النشاط', _liveOrders.length),
+                Expanded(child: _tabChip(_OpTab.reviews, LucideIcons.star, 'الآراء', null)),
+                const SizedBox(width: 4),
+                Expanded(child: _tabChip(_OpTab.history, LucideIcons.clock, 'السجل', null)),
+                const SizedBox(width: 4),
+                Expanded(child: _tabChip(_OpTab.drivers, LucideIcons.bike, 'الكباتن', approvedCount)),
+                const SizedBox(width: 4),
+                Expanded(child: _tabChip(_OpTab.live, LucideIcons.zap, 'النشاط', _liveOrders.length)),
               ],
+            ),
+          ),
+          PressScale(
+            scale: 0.97,
+            onTap: () => showBroadcastDialog(context, sender: widget.user),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                color: C.emerald50,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: C.emerald200),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(LucideIcons.send, size: 16, color: C.emerald600),
+                  const SizedBox(width: 8),
+                  Text('رسالة للمستخدمين / الكباتن',
+                      style: T.s(12, T.w900, C.emerald700)),
+                ],
+              ),
             ),
           ),
         ],
@@ -270,13 +297,15 @@ class _OperatorDashboardState extends State<OperatorDashboard> {
     return GestureDetector(
       onTap: () => setState(() => _activeTab = tab),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 14),
         decoration: BoxDecoration(
           color: active ? C.slate950 : null,
           borderRadius: BorderRadius.circular(20),
           boxShadow: active ? Sh.xxl() : null,
         ),
-        child: Row(
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, size: 16, color: active ? C.white : C.slate400),
@@ -298,6 +327,7 @@ class _OperatorDashboardState extends State<OperatorDashboard> {
               ),
             ],
           ],
+          ),
         ),
       ),
     );

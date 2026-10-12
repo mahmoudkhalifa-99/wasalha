@@ -6,7 +6,8 @@
 // عمداً لمطابقة التناقض الموجود في الكود الأصلي بالحرف الواحد.
 import 'models/models.dart';
 
-const double platformCommissionRate = 0.15;
+/// رسوم المنصة الثابتة على كل مشوار مكتمل (بالجنيه). مش نسبة مئوية.
+const double platformFeePerTrip = 5;
 
 /// البيانات الجغرافية الشاملة لمحافظة المنوفية (10 مراكز)
 final List<District> menofiaData = [
@@ -111,7 +112,7 @@ final List<District> menofiaData = [
   ]),
 ];
 
-final List<Village> ashmounVillagesFull =
+List<Village> get ashmounVillagesFull =>
     menofiaData.expand((d) => d.villages).toList();
 
 class ConfigPricing {
@@ -138,7 +139,7 @@ class ConfigPricing {
 const configDefaultPricing = ConfigPricing(
   basePrice: 5,
   pricePerKm: 4,
-  minPrice: 30,
+  minPrice: 25, // = minTripFare في pricing.dart
   maxPrice: 900,
   sameVillagePrice: 25,
   deliveryBasePrice: 30,

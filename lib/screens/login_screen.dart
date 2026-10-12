@@ -1,13 +1,10 @@
-import 'dart:async';
 import 'dart:ui';
 
-import 'package:cloud_firestore/cloud_firestore.dart' hide Order, Blob;
 import 'package:firebase_auth/firebase_auth.dart' as fb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../constants.dart';
 import '../models/models.dart';
@@ -18,9 +15,9 @@ import '../theme/app_shadows.dart';
 import '../theme/app_text.dart';
 import '../widgets/common.dart';
 import '../widgets/form_fields.dart';
-import 'onboarding_screen.dart';
-
-enum _OtpStep { input, otp }
+import '../services/remembered_login.dart';
+import '../services/session_prefs.dart';
+import 'verify_email_screen.dart' show needsEmailVerification;
 
 const String _googleSvg = '''
 <svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
@@ -34,17 +31,20 @@ const String _googleSvg = '''
 /// نسخة Flutter من pages/Login.tsx — نفس المنطق والتصميم.
 class LoginScreen extends StatefulWidget {
   final void Function(AppUser user) onLogin;
-  const LoginScreen({super.key, required this.onLogin});
+
+  /// لو المستخدم دخل بجوجل ولسه ملوش وثيقة: التطبيق بيفتح مباشرة نموذج
+  /// اختيار (عميل / كابتن) ونوع المركبة بدل ما يتعمله حساب عميل تلقائي.
+  final ({String uid, String email, String displayName})? completeProfileFor;
+  const LoginScreen(
+      {super.key, required this.onLogin, this.completeProfileFor});
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  bool _showOnboarding = true;
   bool _isRegistering = false;
   bool _isCompletingProfile = false;
-  _OtpStep _step = _OtpStep.input;
   UserRole _role = UserRole.customer; // CUSTOMER | DRIVER
   VehicleType _vehicleType = VehicleType.toktok;
 
@@ -59,19 +59,10 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _showPassword = false;
   bool _showConfirmPassword = false;
 
-  // OTP
-  final List<String> _otp = List.filled(6, '');
-  final List<TextEditingController> _otpCtrls =
-      List.generate(6, (_) => TextEditingController());
-  final List<FocusNode> _otpNodes = List.generate(6, (_) => FocusNode());
-  int _resendTimer = 60;
-  bool _canResend = false;
-  Timer? _timer;
-
   // Login
   final _loginEmail = TextEditingController();
   final _loginPassword = TextEditingController();
-  bool _rememberMe = false;
+  bool _rememberMe = SessionPrefs.rememberMe; // الافتراضي مفعّل
 
   // General
   bool _loading = false;
@@ -83,51 +74,86 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
-      if (_step == _OtpStep.otp && _resendTimer > 0) {
-        setState(() => _resendTimer--);
-      }
-      if (_resendTimer == 0 && !_canResend) {
-        setState(() => _canResend = true);
-      }
+    _resumeProfile();
+  }
+
+  @override
+  void didUpdateWidget(covariant LoginScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.completeProfileFor != null &&
+        _googleUserData?.uid != widget.completeProfileFor!.uid) {
+      setState(_resumeProfile);
+    }
+  }
+
+  void _resumeProfile() {
+    final r = widget.completeProfileFor;
+    if (r == null) return;
+    _googleUserData = r;
+    if (_name.text.isEmpty) _name.text = r.displayName;
+    if (_email.text.isEmpty) _email.text = r.email;
+    _isCompletingProfile = true;
+  }
+
+  /// الخروج من نموذج إكمال البيانات (مستخدم جوجل غير مكتمل).
+  Future<void> _cancelCompleteProfile() async {
+    await RememberedLogin.clear();
+    await auth.signOut();
+    if (!mounted) return;
+    setState(() {
+      _isCompletingProfile = false;
+      _googleUserData = null;
+      _errorMsg = null;
     });
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
     for (final c in [
       _name, _phone, _email, _password, _confirmPassword, _village,
-      _loginEmail, _loginPassword, ..._otpCtrls
+      _loginEmail, _loginPassword
     ]) {
       c.dispose();
-    }
-    for (final n in _otpNodes) {
-      n.dispose();
     }
     super.dispose();
   }
 
   // ───────────────────────── المنطق ─────────────────────────
 
-  void _handleResendOtp() {
-    if (!_canResend) return;
-    setState(() {
-      _resendTimer = 60;
-      _canResend = false;
-    });
-    // Logic to resend OTP via WhatsApp/SMS
-    showAppAlert(context, 'تم إعادة إرسال كود التفعيل إلى رقمك');
-  }
-
+  /// نسيت كلمة المرور: بنبعت رابط إعادة تعيين على بريد المستخدم من Firebase Auth.
   Future<void> _handleForgotPassword() async {
-    const adminWhatsApp = '201065019364';
-    const message =
-        'أهلاً إدارة وصلها، نسيت كلمة المرور الخاصة بحسابي وأحتاج للمساعدة في استعادتها.';
-    final url = Uri.parse(
-        'https://wa.me/$adminWhatsApp?text=${Uri.encodeComponent(message)}');
-    await launchUrl(url, mode: LaunchMode.externalApplication);
+    final email = _loginEmail.text.trim();
+    if (!email.contains('@') || !email.contains('.')) {
+      setState(() => _errorMsg =
+          'اكتب بريدك الإلكتروني في الخانة فوق، وبعدين اضغط "نسيت كلمة المرور"');
+      return;
+    }
+    setState(() {
+      _errorMsg = null;
+      _loading = true;
+    });
+    try {
+      await auth.sendPasswordResetEmail(email: email);
+      if (mounted) {
+        await showAppAlert(context,
+            'لو البريد ده مسجل عندنا هيوصله رابط لتغيير كلمة المرور. راجع الـ Inbox والـ Spam.');
+      }
+    } on fb.FirebaseAuthException catch (e) {
+      debugPrint('reset password error: ${e.code}');
+      if (mounted) {
+        setState(() => _errorMsg = switch (e.code) {
+              'invalid-email' => 'البريد الإلكتروني غير صحيح',
+              'network-request-failed' => 'تأكد من الاتصال بالإنترنت وحاول مرة أخرى',
+              'too-many-requests' => 'محاولات كتير، حاول مرة أخرى بعد قليل',
+              _ => 'تعذر إرسال الرابط، حاول مرة أخرى',
+            });
+      }
+    } catch (e) {
+      debugPrint('reset password error: $e');
+      if (mounted) setState(() => _errorMsg = 'تعذر إرسال الرابط، حاول مرة أخرى');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   bool _validateSignUp() {
@@ -135,7 +161,7 @@ class _LoginScreenState extends State<LoginScreen> {
       setState(() => _errorMsg = 'برجاء إدخال الاسم رباعي لضمان التوثيق');
       return false;
     }
-    if (!RegExp(r'^(010|011|012|015)[0-9]{8}$').hasMatch(_phone.text)) {
+    if (!isValidPhone(_phone.text)) {
       setState(() => _errorMsg = 'رقم الهاتف غير صحيح (010, 011, 012, 015)');
       return false;
     }
@@ -182,11 +208,11 @@ class _LoginScreenState extends State<LoginScreen> {
       id: u.uid,
       email: u.email ?? '',
       name: isAdminEmail ? 'مدير المنظومة' : (u.displayName ?? 'مستخدم'),
-      phone: '01000000000',
+      phone: '', // الرقم الحقيقي إجباري: بتطلبه شاشة إكمال الرقم
       role: isAdminEmail ? UserRole.admin : UserRole.customer,
       status: UserStatus.approved,
       zoneId: 'أشمون',
-      wallet: const Wallet(balance: 1000, totalEarnings: 0, withdrawn: 0),
+      wallet: const Wallet(balance: 0, totalEarnings: 0, withdrawn: 0),
     );
   }
 
@@ -197,6 +223,11 @@ class _LoginScreenState extends State<LoginScreen> {
     });
     try {
       final result = await signInWithGoogle();
+      if (_rememberMe) {
+        await RememberedLogin.saveGoogle();
+      } else {
+        await RememberedLogin.clear();
+      }
       final u = result.user!;
       final userSnap = await db.collection('users').doc(u.uid).get();
 
@@ -236,8 +267,21 @@ class _LoginScreenState extends State<LoginScreen> {
       debugPrint('Google sign-in error: $error');
       // المستخدم لغى نافذة تسجيل الدخول بنفسه، مفيش داعي نظهر رسالة خطأ
       if (!isGoogleSignInCancelled(error)) {
-        setState(() =>
-            _errorMsg = 'فشل تسجيل الدخول عبر جوجل، يرجى المحاولة مرة أخرى.');
+        final code = googleSignInErrorCode(error);
+        final hint = switch (code) {
+          'invalid-cert-hash' || 'app-not-authorized' =>
+            'بصمة SHA-1 للتطبيق مش مسجلة في Firebase',
+          'sign_in_failed' =>
+            'إعدادات جوجل غير مكتملة (SHA-1 أو google-services.json)',
+          'missing-id-token' =>
+            'جوجل ما رجّعش توكن، راجع Web client ID وبصمة SHA-1 في Firebase',
+          'operation-not-allowed' => 'تسجيل الدخول بجوجل مش مفعّل في Firebase',
+          'network-request-failed' ||
+          'network_error' =>
+            'تأكد من الاتصال بالإنترنت',
+          _ => 'يرجى المحاولة مرة أخرى',
+        };
+        setState(() => _errorMsg = 'فشل تسجيل الدخول عبر جوجل: $hint ($code)');
       }
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -248,8 +292,8 @@ class _LoginScreenState extends State<LoginScreen> {
     final g = _googleUserData;
     if (g == null) return;
     if (!_requireFilled([_phone.text, _center, _village.text])) return;
-    if (_phone.text.isEmpty || _phone.text.length < 11) {
-      setState(() => _errorMsg = 'يرجى إدخال رقم هاتف صحيح');
+    if (!isValidPhone(_phone.text)) {
+      setState(() => _errorMsg = 'رقم الهاتف غير صحيح (010, 011, 012, 015)');
       return;
     }
     if (_center.isEmpty || _village.text.isEmpty) {
@@ -265,9 +309,7 @@ class _LoginScreenState extends State<LoginScreen> {
         name: _name.text,
         phone: _phone.text,
         role: _role,
-        status: _role == UserRole.driver
-            ? UserStatus.pendingApproval
-            : UserStatus.approved,
+        status: UserStatus.approved,
         vehicleType: _role == UserRole.driver ? _vehicleType : null,
         zoneId: _center,
         wallet: const Wallet(balance: 0, totalEarnings: 0, withdrawn: 0),
@@ -282,53 +324,87 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  String _authErrorMessage(String code, {required bool registering}) {
+    switch (code) {
+      case 'email-already-in-use':
+        return 'البريد الإلكتروني مسجل بالفعل، جرّب تسجيل الدخول';
+      case 'invalid-email':
+        return 'البريد الإلكتروني غير صحيح';
+      case 'weak-password':
+        return 'كلمة المرور ضعيفة، استخدم 8 رموز على الأقل';
+      case 'network-request-failed':
+        return 'تأكد من الاتصال بالإنترنت وحاول مرة أخرى';
+      case 'too-many-requests':
+        return 'محاولات كثيرة، حاول مرة أخرى بعد قليل';
+      case 'user-disabled':
+        return 'تم إيقاف هذا الحساب، تواصل مع الإدارة';
+      case 'operation-not-allowed':
+        return 'تسجيل الدخول بالبريد غير مفعّل في Firebase';
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+        return 'البريد أو كلمة المرور غير صحيحة.';
+      default:
+        return registering
+            ? 'تعذر إنشاء الحساب، حاول مرة أخرى'
+            : 'تعذر تسجيل الدخول، حاول مرة أخرى';
+    }
+  }
+
+  /// بيبعت رابط تأكيد البريد لو الحساب لسه غير مؤكد. فشل الإرسال مش بيوقف
+  /// الدخول: شاشة التأكيد فيها زر إعادة إرسال.
+  Future<void> _sendVerificationMail(fb.User u) async {
+    if (!needsEmailVerification(u)) return;
+    try {
+      await u.sendEmailVerification();
+    } catch (e) {
+      debugPrint('send verification mail failed: $e');
+    }
+  }
+
   Future<void> _handleAuth() async {
+    if (_loading) return;
     setState(() => _errorMsg = null);
 
-    if (_isRegistering && _step == _OtpStep.input) {
+    if (_isRegistering) {
       if (!_requireFilled([
         _name.text, _phone.text, _email.text, _password.text,
         _confirmPassword.text, _center, _village.text
       ])) return;
       if (!_validateSignUp()) return;
-      setState(() => _step = _OtpStep.otp);
-      return;
-    }
-    if (!_isRegistering) {
+    } else {
       if (!_requireFilled([_loginEmail.text, _loginPassword.text])) return;
     }
 
     setState(() => _loading = true);
     try {
       if (_isRegistering) {
-        if (_otp.join().length < 6) {
-          setState(() {
-            _errorMsg = 'الكود غير مكتمل';
-            _loading = false;
-          });
-          return;
-        }
-
         final cred = await auth.createUserWithEmailAndPassword(
-            email: _email.text, password: _password.text);
+            email: _email.text.trim(), password: _password.text);
         final userData = AppUser(
           id: cred.user!.uid,
-          email: _email.text,
+          email: _email.text.trim(),
           name: _name.text,
           phone: _phone.text,
           role: _role,
-          status: _role == UserRole.driver
-              ? UserStatus.pendingApproval
-              : UserStatus.approved,
+          status: UserStatus.approved,
           vehicleType: _role == UserRole.driver ? _vehicleType : null,
           zoneId: _center,
           wallet: const Wallet(balance: 0, totalEarnings: 0, withdrawn: 0),
         );
         await db.collection('users').doc(cred.user!.uid).set(userData.toMap());
+        await _sendVerificationMail(cred.user!);
         widget.onLogin(userData);
       } else {
         final cred = await auth.signInWithEmailAndPassword(
-            email: _loginEmail.text, password: _loginPassword.text);
+            email: _loginEmail.text.trim(), password: _loginPassword.text);
+        if (_rememberMe) {
+          await RememberedLogin.savePassword(
+              _loginEmail.text, _loginPassword.text);
+        } else {
+          await RememberedLogin.clear();
+        }
+        await _sendVerificationMail(cred.user!);
         final userSnap = await db.collection('users').doc(cred.user!.uid).get();
         if (userSnap.exists) {
           widget.onLogin(AppUser.fromMap(
@@ -343,27 +419,19 @@ class _LoginScreenState extends State<LoginScreen> {
           widget.onLogin(defaultUser);
         }
       }
+    } on fb.FirebaseAuthException catch (err) {
+      debugPrint('Auth error: ${err.code}');
+      if (mounted) {
+        setState(() => _errorMsg =
+            _authErrorMessage(err.code, registering: _isRegistering));
+      }
     } catch (err) {
-      setState(() => _errorMsg = 'البريد أو كلمة المرور غير صحيحة.');
+      debugPrint('Auth error: $err');
+      if (mounted) {
+        setState(() => _errorMsg = 'حدث خطأ غير متوقع، حاول مرة أخرى');
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  void _handleOtpChange(int index, String value) {
-    if (value.isNotEmpty && int.tryParse(value) == null) return;
-    final v = value.isEmpty ? '' : value.substring(value.length - 1);
-    setState(() => _otp[index] = v);
-    if (_otpCtrls[index].text != v) _otpCtrls[index].text = v;
-    if (value.isNotEmpty && index < 5) _otpNodes[index + 1].requestFocus();
-  }
-
-  void _handleOtpKey(int index, KeyEvent e) {
-    if (e is KeyDownEvent &&
-        e.logicalKey == LogicalKeyboardKey.backspace &&
-        _otp[index].isEmpty &&
-        index > 0) {
-      _otpNodes[index - 1].requestFocus();
     }
   }
 
@@ -371,11 +439,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_showOnboarding) {
-      return OnboardingScreen(
-          onComplete: () => setState(() => _showOnboarding = false));
-    }
-
     final md = isMd(context);
     return Scaffold(
       backgroundColor: C.slate50,
@@ -408,7 +471,7 @@ class _LoginScreenState extends State<LoginScreen> {
                         Padding(
                           padding: const EdgeInsets.only(top: 24),
                           child: Text(
-                            'جميع الحقوق محفوظة © تطبيق وصلها المنوفية • خدمة ذكية على مدار 24 ساعة',
+                            '• تطبيق وصلها المنوفية •\nجميع الحقوق محفوظة © M.R Mahmoud Khalifa',
                             textAlign: TextAlign.center,
                             style: T.s(12, T.w700, C.slate400),
                           ),
@@ -790,7 +853,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 Text('إكمال بياناتك',
                     textAlign: TextAlign.center,
                     style: T.s(20, T.w900, C.slate900, letterSpacing: -0.5)),
-                Text('خطوة أخيرة للبدء: أضف هاتفك ومنطقتك',
+                Text('اختار نوع حسابك (عميل أو كابتن) وأضف هاتفك ومنطقتك',
                     textAlign: TextAlign.center,
                     style: T.s(12, T.w700, C.slate400)),
               ],
@@ -827,6 +890,12 @@ class _LoginScreenState extends State<LoginScreen> {
                 ? const Spinner()
                 : _submitText('حفظ البيانات والدخول'),
           ),
+          _gap(8),
+          TextButton(
+            onPressed: _loading ? null : _cancelCompleteProfile,
+            child: Text('رجوع وتسجيل الخروج',
+                style: T.s(12, T.w700, C.slate400)),
+          ),
         ],
       ),
     );
@@ -847,7 +916,6 @@ class _LoginScreenState extends State<LoginScreen> {
               _errorMsg = null;
             } else {
               _isRegistering = true;
-              _step = _OtpStep.input;
               _errorMsg = null;
             }
           }),
@@ -856,7 +924,7 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
         _gap(20),
         if (_isRegistering)
-          (_step == _OtpStep.input ? _registerInput(context) : _registerOtp())
+          _registerInput(context)
         else
           _loginForm(),
       ],
@@ -953,134 +1021,6 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  Widget _registerOtp() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Column(
-          children: [
-            Text('تأكيد رقم الهاتف',
-                textAlign: TextAlign.center,
-                style: T.s(24, T.w900, C.slate900, letterSpacing: -0.6)),
-            const SizedBox(height: 8),
-            Text('أدخل الرمز المكون من 6 أرقام المرسل إلى',
-                textAlign: TextAlign.center,
-                style: T.s(12, T.w700, C.slate400, height: 1.625)),
-            Directionality(
-              textDirection: TextDirection.ltr,
-              child: Text(_phone.text,
-                  textAlign: TextAlign.center,
-                  style: T.s(12, T.w700, C.emerald600, height: 1.625)),
-            ),
-          ],
-        ),
-        _gap(16),
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          child: Directionality(
-            textDirection: TextDirection.ltr,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                for (var idx = 0; idx < 6; idx++)
-                  Padding(
-                    padding: EdgeInsets.only(left: idx == 0 ? 0 : 8),
-                    child: _otpBox(idx),
-                  ),
-              ],
-            ),
-          ),
-        ),
-        _gap(16),
-        PrimaryButton(
-          onTap: _loading ? null : _handleAuth,
-          child: _loading
-              ? const Spinner()
-              : Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(LucideIcons.shieldCheck,
-                        size: 20, color: C.white),
-                    const SizedBox(width: 8),
-                    _submitText('تأكيد الرمز'),
-                  ],
-                ),
-        ),
-        _gap(12),
-        Center(
-          child: _canResend
-              ? GestureDetector(
-                  onTap: _handleResendOtp,
-                  child: Text('إعادة إرسال الكود',
-                      style: T.s(12, T.w900, C.emerald600)),
-                )
-              : Text.rich(
-                  TextSpan(children: [
-                    TextSpan(
-                        text: 'إعادة الإرسال خلال ',
-                        style: T.s(12, T.w700, C.slate400)),
-                    TextSpan(
-                        text: '$_resendTimer',
-                        style: T.s(12, T.w900, C.emerald600)),
-                    TextSpan(
-                        text: ' ثانية', style: T.s(12, T.w700, C.slate400)),
-                  ]),
-                ),
-        ),
-        _gap(16),
-        GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => setState(() => _step = _OtpStep.input),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Text('تعديل رقم الهاتف',
-                textAlign: TextAlign.center,
-                style: T.s(12, T.w900, C.slate400)),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _otpBox(int idx) {
-    final has = _otp[idx].isNotEmpty;
-    return Focus(
-      canRequestFocus: false,
-      skipTraversal: true,
-      onKeyEvent: (node, e) {
-        _handleOtpKey(idx, e);
-        return KeyEventResult.ignored;
-      },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 150),
-        width: 40,
-        height: 56,
-        decoration: BoxDecoration(
-          color: has ? C.white : C.slate50,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-              color: has ? C.emerald600 : C.slate200, width: 2),
-        ),
-        child: TextField(
-          controller: _otpCtrls[idx],
-          focusNode: _otpNodes[idx],
-          textAlign: TextAlign.center,
-          keyboardType: TextInputType.number,
-          inputFormatters: otpInputFormatters,
-          cursorColor: C.emerald600,
-          style: T.s(20, T.w900, C.slate900),
-          decoration: const InputDecoration(
-            border: InputBorder.none,
-            isCollapsed: true,
-            counterText: '',
-            contentPadding: EdgeInsets.symmetric(vertical: 14),
-          ),
-          onChanged: (v) => _handleOtpChange(idx, v),
-        ),
-      ),
-    );
-  }
-
   Widget _loginForm() {
     return Reveal(
       child: Column(
@@ -1116,13 +1056,19 @@ class _LoginScreenState extends State<LoginScreen> {
               children: [
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: () => setState(() => _rememberMe = !_rememberMe),
+                  onTap: () {
+                    setState(() => _rememberMe = !_rememberMe);
+                    SessionPrefs.setRememberMe(_rememberMe);
+                  },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       MiniCheckbox(
                           value: _rememberMe,
-                          onChanged: (v) => setState(() => _rememberMe = v)),
+                          onChanged: (v) {
+                            setState(() => _rememberMe = v);
+                            SessionPrefs.setRememberMe(v);
+                          }),
                       const SizedBox(width: 8),
                       Text('تذكرني', style: T.s(12, T.w700, C.slate500)),
                     ],
